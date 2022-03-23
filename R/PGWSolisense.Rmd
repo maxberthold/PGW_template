@@ -1,0 +1,631 @@
+---
+title: "Importing and tidying data from the Solisense"
+author: "Maximilian Berthold"
+date: "`r format(Sys.Date())`"
+output:
+  html_document:
+    df_print: paged
+    code_folding: hide   
+csl: plos-one.csl
+---
+
+*Some of the code used to create this R Notebook was refurbished from "PlateAbImport.Rmd" written by Maximilian Berthold, Douglas A. Campbell, Melissa L. Rioux, Sarah J Gore, and Alyson MacCormack.*
+
+```{r set project variables}
+Project <- "salinity_growth"
+DataOut <- file.path("ProcessData")
+DataCalibration <- file.path("CalibrationData")
+Catalog <- file.path("MURIS_catalog.csv")
+FileIDAb <- "OD"
+FileIDSoli <- "_Soli_"
+FileReadSoli <- "Soli"
+DataFolder <- "ProcessData"
+
+DataPath <- file.path("Solisense", fsep = .Platform$file.sep)
+
+FileID <- "fit"
+
+FileEncode <- "UTF-8" 
+Delimiter <- ","
+
+HeaderRows <- 0
+AbsWL = c(680, 720, 750) #select OD's of interest from plategrowth.Rds
+
+
+
+```
+
+
+```{r load libraries}
+
+library(tidyverse)
+library(lubridate)
+library(magrittr)
+library(broom)
+library(modelr)
+
+```
+
+
+```{r load local catalog, message = FALSE, warning = FALSE, echo=FALSE}
+#col_types specified for some columns as only the last few rows of a large dataset contained values for these columns and the values were not being read in properly
+#there is probably a more robust way to deal with this issue
+MetaData <- read_csv("../MURIS_catalog.csv") %>%
+  rename(CultureID = id)
+
+MetaData <- MetaData %>%
+  mutate(ExpSalinity = (((culture_inocul_L * source_salinity)+(media_inocul_L*salinity))/(culture_inocul_L+media_inocul_L)))
+
+CalibrationCellCount <- readRDS(file = file.path(DataCalibration, "salinity_growth_Calibration_OD_CellCount.Rds",fsep = .Platform$file.sep)) %>%
+  mutate(Wavelength = as.character(Wavelength)) %>% 
+  dplyr::select(c(strain, Wavelength, estimate_slope)) %>%
+  pivot_wider(values_from = estimate_slope, names_from = Wavelength, names_prefix =  "CC_slope_")
+
+CalibrationChloro <- readRDS(file = file.path(DataCalibration, "salinity_growth_Calibration_OD_Chl.Rds",fsep = .Platform$file.sep)) %>%
+  mutate(Wavelength = as.character(Wavelength)) %>%
+  filter(Wavelength %in% c("680min720", "680min750")) %>%
+  dplyr::select(c(strain, Wavelength, estimate_Chl_ugL_mean)) %>%
+  pivot_wider(values_from = estimate_Chl_ugL_mean, names_from = Wavelength, names_prefix =  "Chl_slope_")
+
+GrowthLong <- readRDS(file = file.path(DataFolder,paste(Project,FileIDAb, "GrowthLong.Rds", sep  = "_"),fsep = .Platform$file.sep)) %>%
+  rename(CultureID = id, StartDateTimeInoc = datetime) %>%
+  #filter(E_hours == '0') %>% #select only E-hour == 0, as starting point for plate inoculation and following Solisense-analyses
+  filter(Wavelength %in% AbsWL) %>%
+  mutate(ObsDate = format(StartDateTimeInoc, format = "%Y-%m-%d")) %>%
+  mutate(ObsDate = ymd(ObsDate))
+
+GrowthLong_CC_chl <- GrowthLong %>%
+  filter(Wavelength %in% c(680, 720, 750)) %>%
+  mutate(CorrOD = if_else(CorrOD < 0.001, 0.001, CorrOD)) %>% #experimentally test to set values below 0.001 to 0.001 (~detection limit device) 
+  mutate(Wavelength = as.character(Wavelength)) %>%
+  pivot_wider(id_cols = -c(OD, AvBlankOD), names_from = Wavelength, values_from = CorrOD, names_glue = "nm_{Wavelength}") %>%
+  mutate("680min720" = nm_680 - nm_720, "680min750" = nm_680 - nm_750) %>%
+  pivot_longer(cols = c(nm_680, nm_720, nm_750, "680min720", "680min750"), values_to = "CorrOD", names_to = "Wavelength") %>%
+  mutate(Wavelength = str_remove(Wavelength, "nm_")) %>%
+  filter(E_hours != 'NA') %>%
+  pivot_wider(values_from = CorrOD, names_from = Wavelength, names_prefix = "OD_") %>%
+  full_join(CalibrationCellCount, by = c("strain" = "strain")) %>%
+  mutate(RegresCellCount_mL_720 = OD_720/CC_slope_720,
+         RegresCellCount_mL_750 = OD_750/CC_slope_750) %>%
+  full_join(CalibrationChloro, by = c("strain" = "strain")) %>%
+  mutate(RegresChl_ugL_680_720 = OD_680min720/Chl_slope_680min720,
+         RegresChl_ugL_680_750 = OD_680min750/Chl_slope_680min750) %>%
+  dplyr::select(-c(ObsTime, DM))
+
+SolisenseCal <- readRDS("../FluorO2/ProcessData/FluorO2_O2FRRf_lms.Rds") %>%
+  filter(source != "O2FRRf445_Nest %>% unnest(PSIIETRO2lm_tidy)") %>% #filter out regression containing PCC6803
+  rename("ETR_term" = "term", "ETR_slope" = "estimate") %>% 
+  dplyr::select(c(Ex_WL, ETR_term, ETR_slope))
+
+```
+
+
+```{r list PSI files for file import}
+SolisenseFiles <- list.files(path = DataPath, pattern = FileID, full.names = TRUE)
+
+#test for duplicate file names
+unique(duplicated(SolisenseFiles))
+```
+
+
+```{r data read adds filename and cdate, warning=FALSE, message=FALSE, echo=FALSE}
+#design choice 2 file reading functions or add a filetype variable to a single function
+#stringsAsFactors =FALSE somewhere? 
+
+read.delim_plus <- function(flnm, file_encode, delimiter, header_rows){read.delim(flnm, fileEncoding = file_encode, sep = delimiter,  skip = header_rows, row.names = NULL) %>% mutate(filename = flnm, cdatetime = ymd_hms(file.info(flnm)$ctime))
+}
+
+##### only run, when new files were added, takes very long with >4500 files
+# memory.limit(size = 30000)
+# SolFit <- SolisenseFiles %>% map_df(~read.delim_plus(flnm = ., file_encode = FileEncode, delimiter = Delimiter, header_rows = HeaderRows))
+# saveRDS(SolFit, file.path(DataOut,
+# paste(Project, FileIDSoli <- "Soli", "SolisenseFiles.Rds", sep = "_"), fsep = .Platform$file.sep))
+
+SolFit <- readRDS(file = file.path(DataFolder,paste(Project, FileReadSoli, "SolisenseFiles.Rds", sep  = "_"),fsep = .Platform$file.sep)) 
+
+SolFitTrim <-SolFit %>% 
+  filter(!grepl("----", DATE)) %>% # remove rows with "----"
+  dplyr::select(-c("Lon", "Lat", "GPS_stat", "X")) %>% # remove superfluous columns
+  separate(col = filename, into = c("device", "project", "datetime", "CultureID","Ex_WL", "data", "csv"), sep = "([\\:\\/\\_\\.\\\\])", remove = FALSE) %>%
+  dplyr::select(-c("device", "data", "csv"))  %>%
+  mutate(DATE = ymd(DATE), 
+         TIME = as.character(TIME))%>% #time-column is read in as factor, and as.character changes it to numeric; using lubdridate::hms would only change the format to 13H 4M 2S but does not work later one to merge into one DateTime-column
+  rename(ObsDate = DATE, 
+         ObsTime = TIME, 
+         FvFm = "Fv.Fm") %>%
+  mutate(datetime = as.numeric(datetime), 
+         Ex_WL = as.factor(as.numeric(Ex_WL))) %>%
+  mutate(FvFm = as.numeric(as.character(FvFm)), 
+         Light_1 = as.numeric(as.character(Light_1)), 
+         Light_5 = as.numeric(as.character(Light_5))) %>%
+  mutate(datetime = ymd_hm(datetime)) %>%
+  rename(StartDateTimeSol = datetime) %>%
+  drop_na(StartDateTimeSol) %>%
+  mutate(ObsTime = hms(ObsTime)) %>%
+  mutate(ObsDateTime = ymd_hms(paste(ObsDate, ObsTime))) %>%
+  relocate(ObsDateTime, .after = ObsTime) %>%
+  relocate(CultureID, .before = ObsDate) %>%
+  mutate(across(.cols = c(Light_1:p680Q), .fns = as.character),
+         across(.cols = c(Light_1:p680Q), .fns = as.numeric)) %>%
+  mutate(ActPAR = Light_1 + Light_2 + Light_3 + Light_4 + Light_5 + Light_6)
+
+SolFitStep <- SolFitTrim %>%
+  group_by(Source.DataFile, CultureID, Ex_WL) %>%
+  mutate(Step_s = replace_na(as.numeric(ObsDateTime - lag(ObsDateTime)), 11), .after = ObsDateTime) %>% 
+  mutate(LR_s = as.numeric(ObsDateTime - ObsDateTime[1]), .after = Step_s) %>%
+  mutate(Dark1s = if_else(Step_s > 5, 0, 1), .after = Step_s) %>%
+  relocate(Ex_WL, .after = Dark1s) %>%
+  relocate(ActPAR, .after = Ex_WL)
+
+SolFitMeta <- right_join(SolFitStep, MetaData) %>%
+  drop_na(Source.DataFile)
+
+# SolFitMetaGrowth <- right_join(SolFitStep, SolFitMeta, by = c("CultureID", "ObsDate")) %>%
+#   drop_na(Source.DataFile)
+
+```
+
+
+Oxborough & Baker 1997 for Fo'
+```{r estimate parameters}
+#think about nest_by and map?
+SolFitParam <- SolFitMeta %>%
+  group_by(CultureID, Ex_WL, Source.DataFile) %>%
+  mutate(Fodark = Fo[1],
+         Fmdark = Fm[1],
+         Sigdark = Sig[1],
+         aLHIIdark = (Fmdark * Fodark)/(Fmdark - Fodark),
+         Fomin = min(Fo, na.rm = TRUE),
+         Fmmax = max(Fm, na.rm = TRUE),
+         FoOxbo = Fomin/(((Fmmax - Fomin)/Fmmax) + (Fomin/Fm)),
+         Sigmax = max(Sig, na.rm = TRUE),
+         aLHIIminmax = (Fmmax * Fomin)/(Fmmax - Fomin),
+         Sig_m2psii = Sig/1E20,
+         ActPAR_photonsm2s = ActPAR *  6.022e17,
+         Ctau1 = 1/(1 + (Sig_m2psii * ActPAR_photonsm2s * (Tau1QA/1000000))),
+         Ctau2 = 1/(1 + (Sig_m2psii * ActPAR_photonsm2s * (Tau2QA/1000000))),
+         qp = (Fm - Fo)/(Fm - lead(Fo)),
+         qpOxbo = (Fm - Fo)/(Fm - FoOxbo),
+         JVPSII_aLHIIminmax = ActPAR_photonsm2s * aLHIIminmax * FvFm,
+         JVPSII_aLHIIdark = ActPAR_photonsm2s * aLHIIdark * FvFm,
+         ETRCtau1 = Sig_m2psii * Ctau1 * ActPAR_photonsm2s,
+         ETRCtau2 = Sig_m2psii * Ctau2 * ActPAR_photonsm2s,
+         ETRqp = Sig_m2psii * qp * ActPAR_photonsm2s,
+         ETRqpOxbo = Sig_m2psii * qpOxbo * ActPAR_photonsm2s,
+         JVPSII_ETRtau1 = ETRCtau1 * Fomin/Sigmax * ActPAR_photonsm2s,
+         JVPSII_ETRqpOxbo = ETRqpOxbo * Fomin/Sigmax * ActPAR_photonsm2s) %>%
+  ungroup() %>%
+  full_join(SolisenseCal) %>%
+  mutate(ETR_L1_s1 = JVPSII_aLHIIminmax*ETR_slope)
+ 
+SolFitUp <- SolFitParam %>%
+  filter(ActPAR != "0") %>%
+  filter(ActPAR < lead(ActPAR)) %>%
+  drop_na(ETR_L1_s1)
+
+SolFitHigh <- SolFitParam %>%
+  filter(ActPAR == 320)
+
+SolFitLong <- rbind(SolFitUp, SolFitHigh)
+
+SolFitCorr <- SolFitLong %>%
+  group_by(StartDateTimeSol, CultureID, Ex_WL) %>%
+  nest() %>%
+  mutate(LRC_model = map(data, possibly(~ lm(ETR_L1_s1 ~ 0 + ActPAR, data = .x), otherwise = NULL)),
+         LRC_tidy = map(LRC_model, possibly(tidy, otherwise = NULL)),
+         LRC_resid = map(LRC_model, possibly(resid, otherwise = NULL)),
+         LRC_glance = map(LRC_model, possibly(glance, otherwise = NULL)),
+         LRC_predict = map(LRC_model, possibly(augment, otherwise = NULL))) %>%
+  dplyr::select(-c(data, LRC_model)) %>%
+  unnest(cols = LRC_glance) %>%
+  dplyr::select(CultureID, LRC_tidy) %>%
+  unnest(cols = LRC_tidy) %>%
+  rename("LRC_JVPSII_ETR_slope" = "estimate", "LRC_term" = "term", "LRC_JVPSII_ETR_STerr" = "std.error")
+
+SolCorrAll <- full_join(SolFitParam, SolFitCorr) %>% 
+  dplyr::select(c(ObsDate, ObsTime, CultureID, Ex_WL, LRC_JVPSII_ETR_slope, LRC_JVPSII_ETR_STerr)) %>%
+  filter(Ex_WL == "445") %>%
+  distinct(LRC_JVPSII_ETR_slope, .keep_all = TRUE)
+  
+
+```
+
+```{r save StrStiMeta, echo=FALSE}
+saveRDS(SolFitParam, file.path(DataOut, 
+paste(Project, "SolFitParam.Rds", sep = "_"), fsep = .Platform$file.sep))
+
+saveRDS(SolCorrAll, file.path(DataCalibration, 
+paste(Project, "SolFitCal.Rds", sep = "_"), fsep = .Platform$file.sep))
+```
+
+
+``` {r preplot different ratios}
+
+SolFitParam %>%
+  filter(Light_1 %in% c(20, 40, 160, 320)) %>%
+  #filter(Ex_WL != "450") %>%
+  filter(par_ue %in% c(30, 150, 300)) %>%
+  # filter(strain %in% "NIES981",
+  #        #salinity %in% c(1)
+  #        ) %>%
+  filter(ETRqp < 1000) %>%
+  drop_na(ETRqp) %>%
+  ggplot() +
+  geom_point(aes(x = (ETRqp), y = (ETRqpOxbo), colour = as.factor(salinity))) +
+  facet_grid(cols = vars(par_ue), rows = vars(strain)) +
+  theme_bw()
+
+GrowthLong_CC_chl %>%
+  filter(par_ue %in% c(30, 150, 300)) %>%
+  # filter(strain %in% "NIES981",
+  #        #salinity %in% c(1)
+  #        ) %>%
+  drop_na(RegresCellCount_mL_750) %>%
+  ggplot() +
+  geom_point(aes(x = (RegresCellCount_mL_750), y = (RegresChl_ugL_680_750), colour = as.factor(salinity))) +
+  facet_grid(cols = vars(par_ue), rows = vars(strain)) +
+  theme_bw()
+
+```
+
+
+``` {r JVPSII:Chl and JVPSII:Cells}
+StrainMax <- c("CZS25K", "CZS48M", "CCMP1333", "CCMP836", "NIES981")
+
+Growth_CC_Chl_Sol <- full_join(GrowthLong_CC_chl, SolCorrAll) %>%
+    mutate(pg_Chl_Cell = RegresChl_ugL_680_750/RegresCellCount_mL_750*1000000,
+           JVPSII_ETR_vol = par_ue*LRC_JVPSII_ETR_slope,
+           JVPSII_cell = JVPSII_ETR_vol/RegresCellCount_mL_750,
+           JVPSII_chl = JVPSII_ETR_vol/RegresChl_ugL_680_750,
+           JVPSII_chl_cell = JVPSII_ETR_vol/pg_Chl_Cell)
+
+Growth_CC_Chl_Sol %>%
+  filter(par_ue %in% c(30, 150, 300)) %>%
+  drop_na(JVPSII_chl) %>%
+  ggplot() +
+  geom_point(aes(x = (RegresChl_ugL_680_750), y = (JVPSII_ETR_vol), colour = as.factor(salinity))) +
+  facet_grid(cols = vars(par_ue), rows = vars(strain)) +
+  theme_bw()
+
+Growth_CC_Chl_Sol %>%
+  filter(par_ue %in% c(30, 150, 300)) %>%
+  filter(strain %in% StrainMax,
+         #salinity %in% c(1)
+         ) %>%
+  drop_na(JVPSII_chl) %>%
+  ggplot() +
+  geom_point(aes(x = (RegresChl_ugL_680_750), y = (JVPSII_chl), colour = as.factor(salinity))) +
+  facet_grid(cols = vars(par_ue), rows = vars(strain)) +
+  theme_bw()
+
+
+Growth_CC_Chl_Sol %>%
+  filter(par_ue %in% c(30, 150, 300)) %>%
+  drop_na(JVPSII_cell) %>%
+  ggplot() +
+  geom_point(aes(x = (RegresCellCount_mL_750), y = (JVPSII_ETR_vol), colour = as.factor(salinity))) +
+  facet_grid(cols = vars(par_ue), rows = vars(strain)) +
+  theme_bw()
+
+Growth_CC_Chl_Sol %>%
+  filter(par_ue %in% c(30, 150, 300)) %>%
+  # filter(strain %in% "CCMP1333",
+  #        #salinity %in% c(1)
+  #        ) %>%
+  drop_na(JVPSII_cell) %>%
+  ggplot() +
+  geom_point(aes(x = (RegresCellCount_mL_750), y = (JVPSII_cell), colour = as.factor(salinity))) +
+  facet_grid(cols = vars(par_ue), rows = vars(strain)) +
+  theme_bw()
+
+Growth_CC_Chl_Sol %>%
+  filter(par_ue %in% c(30, 150, 300)) %>%
+  drop_na(JVPSII_chl_cell) %>%
+  # filter(strain %in% "CZS48M",
+  #        #salinity %in% c(1)
+  #        ) %>%
+  ggplot() +
+  geom_point(aes(x = (pg_Chl_Cell), y = (JVPSII_ETR_vol), colour = as.factor(salinity))) +
+  facet_grid(cols = vars(par_ue), rows = vars(strain)) +
+  theme_bw()
+
+Growth_CC_Chl_Sol %>%
+  filter(par_ue %in% c(30, 150, 300)) %>%
+  filter(strain %in% "NIES981",
+         #salinity %in% c(1)
+         ) %>%
+  drop_na(JVPSII_chl_cell) %>%
+  ggplot() +
+  geom_point(aes(x = (pg_Chl_Cell), y = (JVPSII_chl_cell), colour = as.factor(salinity))) +
+  facet_grid(cols = vars(par_ue), rows = vars(strain)) +
+  theme_bw()
+
+Growth_CC_Chl_Sol %>%
+  filter(par_ue %in% c(30, 150, 300)) %>%
+  # filter(strain %in% "CCMP1333",
+  #        #salinity %in% c(1)
+  #        ) %>%
+  drop_na(JVPSII_cell, JVPSII_chl) %>%
+  ggplot() +
+  geom_point(aes(x = (JVPSII_cell), y = (JVPSII_chl), colour = as.factor(salinity))) +
+  facet_grid(cols = vars(par_ue), rows = vars(strain)) +
+  theme_bw()
+
+```
+
+
+Set variables for project
+```{r project data}
+Project <- "salinity_growth"
+FileID <- "GAM"
+Replic <- "AllSal"
+GamFit <- "FitVal"
+DataFolder <- "ProcessData"
+PlotPath <- "Plots"
+#FitGomp <- 
+WL_nm <- "440_680_750"
+
+is_all_numeric <- function(x) { 
+  !any(is.na(suppressWarnings(as.numeric(na.omit(x))))) & is.character(x) 
+}
+#https://stackoverflow.com/questions/22772279/converting-multiple-columns-from-character-to-numeric-format-in-r
+
+GamPara <- c("Gmu", "Mu")
+
+
+
+
+```
+
+
+
+```{r load libraries, message=FALSE}
+library(tidyverse)
+library(lubridate)
+library(stringr)
+library(broom)
+library(knitr)
+library(minpack.lm)
+library(nlstools)
+library(nlsMicrobio)
+library(plotly)
+library(mgcv)
+library(tidymv)
+library(CCA)
+library(vegan)
+library(cowplot)
+library(glue)
+library(gtable)
+# library(itsadug)
+library(car)
+library(MASS)
+library(faraway)
+library(gridExtra)
+#library(OneR)
+#source("CampbelLabRFunctions.txt")
+# source("C:\\Users\\mberthold\\Campbell Lab Dropbox\\Maximilian Berthold\\Manuscripts_Berthold\\submitted\\First_ECS\\supportroutines4.R")
+
+```
+
+```{r correct JVPSII par_ue correlation vs growth rate data}
+
+
+SolCorrMeta <- full_join(SolCorrAll, MetaData) %>%
+  drop_na(ObsDate) %>%
+  dplyr::group_by(plate, salinity, par_ue) %>%
+  filter(row_number()==1)  #https://stackoverflow.com/questions/13279582/select-the-first-row-by-group
+  
+
+
+FitFilesGAM <- list.files(path = DataFolder, pattern = GamFit, full.names = TRUE)
+
+read.RDS <- function(flnm){readRDS(flnm) %>%
+    mutate(filename = flnm)
+}
+
+#test for duplicate file names
+unique(duplicated(FitFilesGAM))
+
+
+
+ComGrowthFits <- FitFilesGAM %>%
+  map_df(~read.RDS(flnm = .)) %>%
+  dplyr::select(-filename) %>%
+  full_join(GrowthLong_CC_chl) %>%
+  drop_na(estimate) %>%
+  full_join(SolCorrAll) %>%
+  mutate(JVPSII_ETR_vol = par_ue*LRC_JVPSII_ETR_slope,
+         JVPSII_ETR_PhotoPeriod = JVPSII_ETR_vol*3600*photoperiod, #JVPSII is e- L-1 s-1, x 3600 s/h x (photoperiod h)/d
+         JVPSII_cell_d = (JVPSII_ETR_PhotoPeriod/1000)/RegresCellCount_mL_750, #JVPSII is e- L-1 s-1, Cells is mL-1, JVPSII / 1000 for mL conversion
+         JVPSII_chl_d = JVPSII_ETR_PhotoPeriod/RegresChl_ugL_680_750)
+
+gg_y_axis <- "estimate"
+gg_x_axis <- "JVPSII_chl_d"
+PlotTerm <- "Gmu"
+PlotWL <- "680min750"
+PlotFactor <- "Chl"
+MuFilter <- 0.05
+#ErrorTol <- 12.5
+
+p1 <- ComGrowthFits %>%
+  filter(par_ue %in% c(30, 150, 300),
+         term %in% PlotTerm,
+         #estimate > MuFilter,
+         Wavelength %in% PlotWL,
+         DM %in% PlotFactor,
+         # estimate == case_when(std.error/estimate*100 < ErrorTol ~ estimate*1,                          
+         #                 FALSE ~ estimate)
+         ) %>%
+  ggplot() +
+  geom_point(aes(x = !!sym(gg_x_axis), y = !!sym(gg_y_axis), colour = (par_ue))) +
+  ylab(paste("Growth rate", PlotFactor, "(d-1)")) +
+  xlab(paste("JVPSII [",PlotFactor,"]-1 d-1")) +
+  facet_grid(cols = vars(salinity), rows = vars(strain)) +
+  scale_x_continuous(sec.axis = sec_axis(~ . , name = "Salinity", breaks = NULL, labels = NULL)) +
+  scale_y_continuous(sec.axis = sec_axis(~ . , name = "Strain", breaks = NULL, labels = NULL)) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+p1
+
+ggsave(file = file.path(PlotPath, paste(Project, gg_y_axis, gg_x_axis, PlotTerm, PlotFactor, ".png", sep = "_"), fsep = .Platform$file.sep), plot = p1,  height = 7, width = 7)
+
+```
+
+
+
+
+```{r simple (incorrect?) JVPSII par_ue correlation vs growth rate data}
+
+SolCorrMeta <- full_join(SolCorrAll, MetaData) 
+
+FitFilesGAM <- list.files(path = DataFolder, pattern = GamFit, full.names = TRUE)
+
+read.RDS <- function(flnm){readRDS(flnm) %>%
+    mutate(filename = flnm)
+}
+
+#test for duplicate file names
+unique(duplicated(FitFilesGAM))
+
+ComGrowthFits <- FitFilesGAM %>%
+  map_df(~read.RDS(flnm = .)) %>%
+  full_join(SolCorrMeta) %>%
+  drop_na(estimate) %>%
+  mutate(JVPSII_ETR_vol = par_ue*LRC_JVPSII_ETR_slope)
+
+ComGrowthFits %>%
+  filter(par_ue %in% c(30, 150, 300),
+         term %in% "Gmu",
+         estimate > 0.05) %>%
+  ggplot() +
+  geom_point(aes(x = (JVPSII_ETR_vol), y = (estimate), colour = as.factor(salinity))) +
+  facet_grid(cols = vars(par_ue), rows = vars(strain)) +
+  theme_bw()
+
+# ComGrowthFits <- readRDS(file = file.path(DataFolder, paste("salinity_growth_FitVal_CombinedGrowthFits_440_680_720_.Rds"),fsep = .Platform$file.sep))
+# 
+
+
+```
+
+
+``` {r}
+
+
+test <- SolFitParam %>%
+  filter(ActPAR != "0") %>%
+  filter(ActPAR < lead(ActPAR)) %>%
+  drop_na(ETR_L1_s1)
+
+test2 <- SolFitParam %>%
+  filter(ActPAR == 320)
+
+test3 <- rbind(test, test2)
+
+test4 <- test3 %>%
+  group_by(StartDateTimeSol, CultureID, Ex_WL) %>%
+  nest() %>%
+  mutate(LRC_model = map(data, possibly(~ lm(ETR_L1_s1 ~ 0 + ActPAR, data = .x), otherwise = NULL)),
+         LRC_tidy = map(LRC_model, possibly(tidy, otherwise = NULL)),
+         LRC_resid = map(LRC_model, possibly(resid, otherwise = NULL)),
+         LRC_glance = map(LRC_model, possibly(glance, otherwise = NULL)),
+         LRC_predict = map(LRC_model, possibly(augment, otherwise = NULL)))
+  
+resids <- unnest(test4, LRC_resid) 
+
+glance <- unnest(test4, LRC_glance) 
+
+predict <- unnest(test4, LRC_predict)
+
+
+resids %>% 
+  ggplot(aes(CultureID, LRC_resid)) +
+    geom_point(aes(group = Ex_WL), alpha = 1 / 3)
+
+
+glance %>% 
+  ggplot(aes(CultureID, r.squared)) + 
+    geom_jitter(width = 0.5)
+
+predict %>%
+  #filter(CultureID == "MaBe2413") %>%
+  ggplot() + 
+  geom_line(aes(x = ActPAR, y = .fitted), size = 0.5) +
+  geom_point(aes(x = ActPAR, y = ETR_L1_s1), size = 0.6)
+  
+ModelCheck <- full_join(glance, predict)
+
+ModelCheck %>%
+  filter(r.squared < 0.8) %>%
+  separate(StartDateTimeSol, into = c("SolDate", "SolTime", sep = " ", remove = FALSE)) %>%
+  ggplot() + 
+  geom_line(aes(x = ActPAR, y = .fitted), size = 0.5) +
+  geom_point(aes(x = ActPAR, y = ETR_L1_s1), size = 0.6) +
+  facet_grid(cols = vars(CultureID), rows = vars(SolDate))
+
+```
+
+
+
+
+
+```{r select light levels}
+
+
+#select first all 0-light measurements, select every n-th 0-position, as start value and store as index
+#select every 320-light measurement and store as index
+#filter every value that is equally smaller/larger then the value before/after to get increasing and decreasing light steps separated 
+#bind with 320-light measurements, and first/last 0-light measurement for total set of doubletap-experiment
+
+SolFitLightUP <- SolFitMetaGrowth %>%
+  filter(Light_steps > lag(Light_steps)) %>% #filter up to light step 160 and down again, filters out all 0 and 320
+   filter(Light_steps < lead(Light_steps)) #filter out second site of double tap protocol
+
+SolFitLight320 <- SolFitMetaGrowth %>%
+  filter(Light_steps == 320)
+
+SolFitLong <- rbind(SolFitLightUP, SolFitLight320) #bind light steps 320 and first site of double tap protocol
+
+SolFitShortUP <- SolFitMeta %>%
+  filter(Light_steps > lag(Light_steps)) %>% #filter up to light step 160 and down again, filters out all 0 and 320
+   filter(Light_steps < lead(Light_steps)) #filter out second site of double tap protocol
+
+SolFitShort320 <- SolFitMeta %>%
+  filter(Light_steps == 320)
+
+SolFitShort <- rbind(SolFitShortUP, SolFitShort320) %>%
+  group_by(exp_date, strain, source) %>% #group_by ExpDate and salinity to show replicated wells within one consecutive plot, even with different CultureID's
+   mutate(EHours = as.numeric((ObsDateTime - ObsDateTime[1])/3600)) %>%  #group by well, then filter light/dark FvFm, then filter max FvFm and compare to growth light
+   mutate(EDays = EHours/24) %>%
+   ungroup()
+
+# 
+# 
+# SolFitMeta <- SolFitMeta %>%
+#   group_by(exp_date, strain, source) %>% #group_by ExpDate and salinity to show replicated wells within one consecutive plot, even with different CultureID's
+#   mutate(EHours = as.numeric((ObsDateTime - ObsDateTime[1])/3600)) %>%  #group by well, then filter light/dark FvFm, then filter max FvFm and compare to growth light
+#   mutate(EDays = EHours/24) %>%
+#   ungroup()
+
+#Light steps of Ex445 and 590 are not aligned, as SOLISENSE protocol saved Light-levels of 445 in Light_1 and of 590 in Light_5
+
+SolFit_445 <- SolFitTrim %>%
+  filter(Ex_WL == 445) %>%
+  mutate(Light_steps = Light_1 + Light_5)
+
+SolFit_590 <- SolFitTrim %>%
+  filter(Ex_WL == 590) %>%
+  mutate(Light_steps = Light_1 + Light_5)
+
+SolFitAlign <- full_join(SolFit_590, SolFit_445)
+
+SolFitMeta <- right_join(SolFitAlign, MetaData)
+
+SolFitMetaGrowth <- right_join(SolFitAlign, MetaGrowthData, by = c("CultureID", "ObsDate")) %>%
+  mutate(EDays = E_hours/24)
+  #drop_na(StartDateTime) 
+
+
+```
+
+

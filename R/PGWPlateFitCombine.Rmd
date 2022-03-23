@@ -1,0 +1,99 @@
+---
+title: "Combine output from PlateGrowthFit.Rmd into a larger data set for easier plotting and visualization"
+author: "Alyson MacCormack"
+date: "`r format(Sys.Date())`"
+output:
+  html_document:
+    code_folding: hide
+    toc: true
+    toc_float: true
+    df_print: paged
+---
+
+```{r project data}
+Project <- "salinity_growth"
+GompFit <- "Chl_AllSal_TreatGompSpeCo"
+#GompFit <- "Ex440_Em680_TreatGompSpeCo" "CC_AllSal_TreatGompSpeCo" "Chl_AllSal_TreatGompSpeCo"
+LogFit <- "Chl_AllSal_TreatLogSpecificCoeff"
+#LogFit <- "Ex440_Em680_TreatLogSpecificCoeff" "CC_AllSal_TreatLogSpecificCoeff" "Chl_AllSal_TreatLogSpecificCoeff"
+DataFolder <- "ProcessData"
+FileID <- "FitVal"
+FitParam <- "Chl" 
+#OD Chl CC
+#grouping variables for rows & columns, and for nesting for fitting
+RowVar <- "salinity" #expected salinity
+RowVar2 <- "CalcSal"
+ColVar <- "strain"
+NestVar <- "par_ue"
+NestVarII <- "id"
+
+#filtering variables
+nm <- c("440", "680", "750")
+# par = 150
+Strains <- c("CCMP836", "CZS48M", "NIES981", "CCMP1333", "CZS25K")
+# StartDate <- c("20200720")
+
+
+
+```
+
+## Load Libraries
+```{r load libraries}
+library(tidyverse)
+library(lubridate)
+library(stringr)
+library(broom)
+library(knitr)
+library(minpack.lm)
+library(nlstools)
+library(nlsMicrobio)
+library(kableExtra)
+#library(OneR)
+#source("CampbelLabRFunctions.txt")
+```
+
+## Read Data
+```{r read data}
+FitFilesGomp <- list.files(path = DataFolder, pattern = GompFit, full.names = TRUE)
+
+read.RDS <- function(flnm){readRDS(flnm) %>%
+    mutate(filename = flnm)
+}
+
+#test for duplicate file names
+unique(duplicated(FitFilesGomp))
+
+GrowthFitsGomp <- FitFilesGomp %>%
+  map_df(~read.RDS(flnm = .)) %>%
+  mutate(Wavelength = as.factor(Wavelength))
+
+FitFilesLog <- list.files(path = DataFolder, pattern = LogFit, full.names = TRUE)
+
+#test for duplicate file names
+unique(duplicated(FitFilesLog))
+
+
+
+GrowthFitsLog <- FitFilesLog %>%
+  map_df(~read.RDS(flnm = .)) %>%
+  mutate(Wavelength = as.factor(Wavelength))
+
+GrowthFits <- rbind(GrowthFitsGomp, GrowthFitsLog)
+
+# GrowthFits <- FitFiles %>%
+#   map_df(~readRDS(file = .)) %>%
+#   mutate(filename = FitFiles)
+```
+
+```{r tidy data}
+GrowthFitsTidy <- GrowthFits %>% 
+  separate(col = filename, into = c("FilePath", "Project1", "Project2", "DM", "ReplNo", "ModelType", "Strain", "nm", "Rds"), sep = "([\\/\\_\\.\\:])", remove = FALSE) %>%
+  dplyr::select(-c(Rds, Strain, nm)) 
+
+
+```
+
+```{r save data}
+saveRDS(GrowthFitsTidy, file = file.path(DataFolder,paste(Project, FileID, FitParam, "CombinedGrowthFits", str_c(nm, collapse = "_"), ".Rds",sep = "_"),fsep = .Platform$file.sep))
+```
+

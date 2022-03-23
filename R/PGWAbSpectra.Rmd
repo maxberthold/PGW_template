@@ -1,0 +1,403 @@
+---
+title: "Import microbial plate growth absorbance data for salinity growth trials"
+author: "Maximilian Berthold, Douglas A. Campbell, Alyson MacCormack"
+date: "`r format(Sys.Date())`"
+output:
+  html_document:
+    df_print: paged
+    code_folding: hide   
+csl: plos-one.csl
+bibliography: SalinityAlyson.bib
+---
+This .Rmd imports Clariostar Ab wellplate files.
+The size of the wellplate does not matter; the import creates columns for RowColumn LetterNumber (A01 etc.) for the largest plate type in the list of files.
+Import of smaller plate types results in NA in the non-existent RowColumn for that plate.
+
+ToDo:
+
+Other .Rmd
+-get PGW_FLSalinity running
+-organize Slidy summary
+-think about moving MURIS_catalog to GoogleSheets and running import direct from there.
+  Advantage: more generic access?
+  Disadvantage: causes problems with 'knit'.
+
+Done:
+-decide upon project name
+  'salinity_growth', although with hindsight a shorter name would have been better. Changing directory name at this point might disrupt Dropbox folders
+-decide upon catalog name & location (which should be built form project name)
+  Decided to use MURIS_catalog in /MURIS/ directory, rather than project specific catalog. This means we will use 'here' to reach up from the salinity_growth project directory to get the MURIS_catalog.
+  We may revise this design in future.
+  
+-decide where to store data files
+-store raw data files
+-check whether raw files from ClarioStar can be easily imported, or whether we need to go through MARS & reexport
+  (Raw files do not include wavelength info).
+-get import running for AB
+-get ParamPlotSalinity running
+-merge various catalogs; store outdated catalogs 
+-cross check plate numbering; plates 131, 132, 133 seem to be duplicated across different runs with different strains.
+
+```{r set project variables, echo=FALSE}
+Project <- "salinity_growth"
+DataOut <- "ProcessData"
+DataCalibration <- "CalibrationData"
+Catalog <- "MURIS_catalog.csv"
+InocVol <- 0.2 #share of inoculation volume
+CondVol <- 0.8 #share of condition medium, here salinity
+
+#set variables for file import & processing of Absorbance files
+DataPathCS <- file.path("CSdata", fsep = .Platform$file.sep)
+FileIDSingle <- "_Ab_"
+
+FileEncodeCS <- "UTF-8" 
+DelimCS <- ","
+
+#make this more robust to variable file formats by skipping rows until 'Well' detected; not yet implemented
+#https://community.rstudio.com/t/read-csv-file-until/41711/2
+HeaderRowsCS <- 6
+
+#increase memory space on local computer, to cope with large dataset
+memory.limit(size = 35000)
+```
+
+
+```{r load libraries, echo=FALSE, message = FALSE, warning = FALSE} 
+# libraries; Note check actual dependencies
+library(tidyverse)
+library(lubridate)
+#library(googledrive)
+#library(googlesheets4)
+library(stringr)
+library(broom)
+library(knitr)
+library(OneR)
+library(magrittr)
+#library(binr)
+#library(here)
+source("CampbelLabRFunctions.txt")
+```
+
+
+```{r load local catalog, message = FALSE, warning = FALSE, echo=FALSE}
+#name directory with culture catalog
+#generally avoid hard file paths; use only relative
+#set current 'project' name; use for later saving to process_data
+#make more complex to cope with saving of data subsets later
+#hard coded path here to reach upwards to /MURIS/ directory for catalog; difficult to otherwise reach upwards from .Rproj directory 'salinity_growth'
+
+MetaData <- read_csv("../MURIS_catalog.csv")
+MediaData <- read_csv("../MURISMediaCatalog.csv")
+BlankData <- readRDS(file = file.path(DataOut, "salinity_growth_MediaBlankAll.Rds",fsep = .Platform$file.sep))
+CalibrationCellCount <- readRDS(file = file.path(DataCalibration, "salinity_growth_Calibration_OD_CellCount.Rds",fsep = .Platform$file.sep))
+CalibrationChloro <- readRDS(file = file.path(DataCalibration, "salinity_growth_Calibration_OD_Chl.Rds",fsep = .Platform$file.sep)) 
+CalibrationETR <- readRDS(file = file.path(DataCalibration, "salinity_growth_SolFitCal.Rds", fsep = .Platform$file.sep))
+
+# BlankTar <- BlankData %>%
+#   rename("AvBlankODTar" = "AvBlankOD")
+# 
+# BlankInoc <- BlankData %>%
+#   rename("inoc_media_id" = "target_media_id", "AvBlankODInoc" = "AvBlankOD")
+
+# MetaBlankTar <- full_join(MetaData, BlankTar)
+# 
+# MetaBlankInoc <- full_join(MetaData, BlankInoc)
+# 
+# MetaBlank <- full_join(MetaBlankInoc, MetaBlankTar)
+
+MediaDataTarget <- MediaData %>%
+  select(MediaID, MeasuredSalinity_ppt) %>%
+  rename("target_media_id" ="MediaID")
+
+MediaDataInoc <- MediaData %>%
+  select(MediaID, MeasuredSalinity_ppt) %>%
+  rename("inoc_media_id" = "MediaID")  
+
+MetaMediaTarget <- full_join(MetaData, MediaDataTarget) %>%
+  rename("TargMedSal" = "MeasuredSalinity_ppt")
+
+MetaMediaInoc <- full_join(MetaData, MediaDataInoc) %>%
+  rename("InocMedSal" = "MeasuredSalinity_ppt")
+
+
+MetaMedia <- full_join(MetaMediaTarget, MetaMediaInoc) %>%
+  mutate(CalcSal = ((TargMedSal*media_inocul_L)+(InocMedSal*culture_inocul_L))/(media_inocul_L+culture_inocul_L))
+
+MetaMediaBlank <- full_join(MetaMedia, BlankData) 
+
+```
+
+
+```{r load catalog direct from googlesheet, echo=FALSE}
+#implement read with googlesheet name instead of full url
+#Catalog <- drive_get(paste(Project, "Catalog", sep = ""))
+#MetaDataPlateworx <- read_sheet(Catalog$id)
+# <- read_sheet("https://docs.google.com/spreadsheets/d/11GobNEFC5NgAeONy8OQ0kJJrD75aBC_L26pYPkr98Q4/edit#gid=0")
+```
+
+
+```{r set variables for file import & processing ClarioStar Ab, echo=FALSE}
+
+AbFilesCS <- list.files(path = DataPathCS, pattern = FileIDSingle, full.names = TRUE) 
+
+#alternative reading in directly from dropbox directory shared link
+#test <- read.csv("https://www.dropbox.com/s/7xg5u0z1gtjcuol/mtcars.csv?dl=1")
+
+#test for duplicate file names
+unique(duplicated(AbFilesCS))
+```
+
+
+```{r data read adds filename and cdate, warning=FALSE, message=FALSE, echo=FALSE}
+#design choice 2 file reading functions or add a filetype variable to a single function
+#stringsAsFactors =FALSE somewhere? 
+
+read.delim_plus <- function(flnm, file_encode, delimiter, header_rows){read.delim(flnm, fileEncoding = file_encode, sep = delimiter,  skip = header_rows, row.names = NULL) %>% mutate(filename = flnm, cdatetime = ymd_hms(file.info(flnm)$ctime))
+}
+
+
+AbSpecCS <- AbFilesCS %>% map_df(~read.delim_plus(flnm = ., file_encode = FileEncodeCS, delimiter = DelimCS, header_rows = HeaderRowsCS)) 
+
+AbSpecCS <- AbSpecCS  %>%
+  filter(Well != c("Content","Group")) %>%
+  select(1, filename, cdatetime, everything())
+```
+
+
+
+```{r tidy CS Ab files, warning=FALSE, message=FALSE, echo=FALSE}
+#extract data from filename; brittle and complicated.
+#We need to think carefully about how to cope with file paths to outside GrowthWorx.
+
+AbSpecTrimCS <-AbSpecCS %>% 
+  separate(col = filename, into = c("fp1","Project", "DM", "date", "time", "plate","csv"), sep = "([\\/\\_\\.\\:])", remove = FALSE) %>%
+  select(-c("fp1", "csv")) %>%
+  separate(col = plate, into = c("cplate", "plate"), sep = 5) %>%
+  select(-cplate, -Well) %>%
+  rename(Wavelength = X, ObsDate = date, ObsTime = time) %>%
+  rename_all(funs(str_replace(., "0", ""))) %>%
+  subset(Wavelength != "Wavelength [nm]" & Wavelength != "") %>%
+  #robust approach to filter possible ClarioStar-assigned groups in metadata -> not necessary with cultureID
+  unite(datetime, ObsDate, ObsTime, remove = FALSE) %>%
+  mutate(datetime = ymd_hm(datetime), 
+         ObsDate = ymd(ObsDate),
+         Wavelength = as.numeric(as.character(Wavelength)),
+         plate = as.numeric(as.character(plate)))
+  
+
+# #convert data columns to numeric; define only specific col, as wells are already numeric
+# #IMPORTANT: transforms metadata in col[1] to NA
+# cols_num_CS <- c("Wavelength", "plate")
+# 
+# 
+# AbSpecTrimCS[cols_num_CS] <- sapply(AbSpecTrimCS[cols_num_CS], as.numeric)
+# AbSpecTrimCS <- AbSpecTrimCS %>%
+#  filter(!is.na(Wavelength))
+
+#convert to long format for easier ggplot
+AbLongCS <- pivot_longer(data = AbSpecTrimCS, cols = -c(Wavelength, filename:cdatetime), names_to = "well", values_to = "OD")
+
+AbLongCS$OD <- as.numeric(as.character(AbLongCS$OD))
+
+
+# test <- AbLongCS %>%
+#   full_join(MetaData) %>%
+#   group_by(id) %>% mutate(E_hours = as.numeric((datetime - datetime[1])/3600)) %>% ungroup()
+
+```
+
+
+```{r combine metadata and AbLongCS, echo=FALSE}
+#correctly joins both df, and kicks out wells without culture-ID -> empty wells! 
+
+#AbLongCS <- full_join(AbLongCS, BlankData, by = c("plate", "well"))
+AbAllCS <- inner_join(AbLongCS, MetaMediaBlank, by = c("plate" = "plate", "well" = "well", "Wavelength" = "Wavelength"))
+
+
+#AbAllCS <- inner_join(AbLongCS, MetaData, by = c("plate" = "plate", "well" = "well"))
+#AbAllCS <- AbLongCS %>%
+#  inner_join(MetaMediaBlank, by = c("plate" = "plate", "well" = "well", "Wavelength" = "Wavelength"))  #vector is important to correctly bind both, plate and well-col
+#AbAllCS is much shorter than AbLongCS, is this because MetaDataPlateworx is incomplete?
+```
+
+
+
+```{r saltbins and E_hours, echo=FALSE}
+######### something throws out OD values                
+AbAllCS <- AbAllCS %>%
+  mutate(CorrOD = OD - AvBlankOD) %>%
+  filter(!is.na(OD)) %>%
+  distinct()
+
+#bin certain key characteristics, like salinity
+AbAllCS$saltbins <- bin(AbAllCS$CalcSal, nbins = 6, labels = c("1", "5", "10", "18", "25", "34"), method = "clusters", na.omit = FALSE) #If there are wells in the catalog w/o salinity, na.omit needs to be FALSE
+
+AbAllCS$pHbins <- bin(AbAllCS$pH, nbins = 15, labels = c("6.6", "7", "7.2","7.4","7.6","7.8","8","8.2","8.4","8.6","8.8","9", "9.2","9.4","9.6"), method = "length", na.omit = FALSE) #If there are wells in the catalog w/o pH, na.omit needs to be FALSE
+
+#including E_hours to complete df
+GrowthLong <- AbAllCS %>% group_by(id) %>% mutate(E_hours = as.numeric((datetime - datetime[1])/3600),
+                                                  E_days = as.numeric((datetime - datetime[1])/86400)
+                                                  ) %>% 
+  ungroup()
+
+```
+
+
+```{r test growth plot}
+Wavelength_nm = 750
+Plates = c(209, 210, 211)
+OneStrain = "CCMP836"
+#Strains = c("CZS25K", "CCMP1333", "CCMP836", "NIES981", "CZS48M")
+
+GrowthLong %>%
+  #mutate(strain = as.factor(strain)) %>%
+  filter(Wavelength == Wavelength_nm) %>%
+  #filter (strain %in% OneStrain) %>%
+  filter(exp_date == "20200902") %>%
+  #filter(plate %in% Plates) %>%
+  #filter(source_salinity == 1) %>%
+  filter(OD <=1.5) %>%
+  ggplot()+
+  geom_point(aes(x = (E_days), y = (CorrOD), colour = as.factor(par_ue))) +
+  #scale_color_gradient(low="green", high="blue") +
+  facet_grid(rows = vars(par_ue), cols = vars(CalcSal)) + 
+  #xlim(0, 275) +
+  theme_bw() + 
+  labs(caption = paste(Wavelength_nm, "nm", "strain"))
+
+#  +
+ # coord_cartesian(xlim = c(0, 250)) +
+
+  # ggtitle("Growth plot of Haslea with changing pH at different light levels \n(pH increased with buffers)")+
+ #labs(caption = paste(Wavelength_nm, "nm; PAR", par, "uE")) +
+```
+
+
+
+```{r save GrowthLong, echo=FALSE}
+
+# Project <- "salinity_growth"
+# DataOut <- "process_data"
+FileIDOD <- "_OD_"
+saveRDS(GrowthLong, file.path(DataOut, 
+paste(Project, FileIDOD, "GrowthLong.Rds", sep = ""), fsep = .Platform$file.sep))
+```
+
+
+```{r save GrowthLongCC, echo=FALSE}
+
+
+GrowthLongCC <- full_join(GrowthLong, CalibrationCellCount) %>%
+  mutate(CorrOD = if_else(CorrOD < 0.001, 0.001, CorrOD)) %>% #experimentally test to set values below 0.001 to 0.001 (~detection limit device) 
+  mutate(RegresCellCount_mL = CorrOD/estimate_slope) %>%
+  full_join(CalibrationETR, by = c("id" = "CultureID", "ObsDate" = "ObsDate")) %>%
+  mutate(ETR_JVPSII = par_ue*LRC_ETR_slope,
+         JVPSII_cell = ETR_JVPSII/RegresCellCount_mL)
+
+Wavelength_nm = 720
+Plates = c(209, 210, 211)
+OneStrain = "CCMP1333"
+#Strains = c("CZS25K", "CCMP1333", "CCMP836", "NIES981", "CZS48M")
+
+coeff <- 10
+
+GrowthLongCC %>%
+  #mutate(strain = as.factor(strain)) %>%
+  filter(Wavelength == Wavelength_nm) %>%
+  #filter (strain %in% OneStrain) %>%
+  filter(exp_date == "20201005") %>%
+  #filter(plate %in% Plates) %>%
+  #filter(source_salinity == 1) %>%
+  filter(OD <=1.5) %>%
+  ggplot(aes(x = E_days, colour = Legend))+
+  geom_point(aes(y = (RegresCellCount_mL), colour = "Cell Count")) +
+  geom_point(aes(y = (JVPSII_cell/coeff), colour = "JVPSI/Cell")) +
+  #scale_color_gradient(low="green", high="blue") +
+  facet_grid(rows = vars(par_ue), cols = vars(CalcSal)) + 
+  #xlim(0, 275) +
+  scale_y_continuous(
+    name = "Regres_CellCount",
+    sec.axis = sec_axis(~.*coeff, name = "JVPSII_cell")) +
+  scale_colour_manual(values = c("brown", "red"),
+                       guide = guide_legend(override.aes = list(shape = c(16, 7)))) +
+  theme_bw() + 
+  labs(caption = paste(Wavelength_nm, "nm", "strain"))
+ggsave(filename = file.path("Plots", paste(Project, Wavelength_nm, OneStrain,"JVPSII_Cells.png", sep = "_"),fsep = .Platform$file.sep ), height = 4, width = 6)
+
+FileIDCC <- "_CC_"
+saveRDS(GrowthLongCC, file.path(DataOut, 
+paste(Project, FileIDCC, "GrowthLong.Rds", sep = ""), fsep = .Platform$file.sep))
+
+
+GrowthLongCC %>%
+  drop_na(ETR_JVPSII) %>%
+  ggplot(aes(RegresCellCount_mL, ETR_JVPSII, colour = as.factor(par_ue))) +
+  geom_point() +
+  facet_wrap(~strain) +
+  #facet_grid(rows = vars(strain), cols = vars(CalcSal)) +
+  theme_bw()
+```
+
+
+```{r save GrowthLongChl, echo=FALSE}
+#https://stackoverflow.com/questions/26587940/ggplot2-different-legend-symbols-for-points-and-lines
+
+GrowthLongChl <- GrowthLong %>%
+  mutate(Wavelength = as.character(Wavelength)) %>%
+  filter(Wavelength %in% c("680", "720", "750")) %>%
+  pivot_wider(id_cols = -c(OD, AvBlankOD), names_from = Wavelength, values_from = CorrOD, names_glue = "nm_{Wavelength}") %>%
+  mutate("680min720" = nm_680 - nm_720, "680min750" = nm_680 - nm_750) %>%
+  pivot_longer(cols = c(nm_680, nm_720, nm_750, "680min720", "680min750"), values_to = "CorrOD", names_to = "Wavelength") %>%
+  mutate(Wavelength = str_remove(Wavelength, "nm_")) %>%
+  mutate(CorrOD = if_else(CorrOD < 0.001, 0.001, CorrOD)) %>% #experimentally test to set values below 0.001 to 0.001 (~detection limit device) 
+  full_join(CalibrationChloro) %>%
+  mutate(RegresChl_ugL = CorrOD/estimate_Chl_ugL_mean) %>%
+  full_join(CalibrationETR, by = c("id" = "CultureID", "ObsDate" = "ObsDate")) %>%
+  mutate(ETR_JVPSII = par_ue*LRC_ETR_slope,
+         JVPSII_chl = ETR_JVPSII/RegresChl_ugL)
+
+Wavelength_nm = "680min750"
+Plates = c(209, 210, 211)
+OneStrain = "CCMP1333"
+#Strains = c("CZS25K", "CCMP1333", "CCMP836", "NIES981", "CZS48M")
+
+coeff <- 10^11
+
+GrowthLongChl %>%
+  #mutate(strain = as.factor(strain)) %>%
+  filter(Wavelength %in% Wavelength_nm) %>%
+  #filter (strain %in% OneStrain) %>%
+  filter(exp_date == "20201005") %>%
+  #filter(plate %in% Plates) %>%
+  #filter(source_salinity == 1) %>%
+  #filter(OD <=1.5) %>%
+  ggplot(aes(x = E_days, colour = Legend))+
+  geom_point(aes( y = (RegresChl_ugL), colour = "Chl")) +
+  geom_point(aes(y = (JVPSII_chl/coeff), colour = "JVPSI/Chl")) +
+  #scale_color_gradient(low="green", high="blue") +
+  facet_grid(rows = vars(par_ue), cols = vars(CalcSal)) + 
+  #xlim(0, 275) +
+  scale_y_continuous(
+    name = "RegresChl_ugL",
+    sec.axis = sec_axis(~.*coeff, name = "JVPSII_chl")) +
+  scale_colour_manual(values = c("green", "red"),
+                       guide = guide_legend(override.aes = list(shape = c(16, 7)))) +
+  theme_bw() + 
+  labs(caption = paste(Wavelength_nm, "nm", OneStrain))
+ggsave(filename = file.path("Plots", paste(Project, Wavelength_nm, OneStrain,"JVPSII_Chl.png", sep = "_"),fsep = .Platform$file.sep ), height = 4, width = 6)
+
+FileIDChl <- "_Chl_"
+saveRDS(GrowthLongChl, file.path(DataOut, 
+paste(Project, FileIDChl, "GrowthLong.Rds", sep = ""), fsep = .Platform$file.sep))
+
+GrowthLongChl %>%
+  drop_na(ETR_JVPSII) %>%
+  ggplot(aes(RegresChl_ugL, ETR_JVPSII, colour = as.factor(par_ue))) +
+  geom_point() +
+  facet_wrap(~strain) +
+  #facet_grid(rows = vars(strain), cols = vars(CalcSal)) +
+  theme_bw()
+
+```
+
+

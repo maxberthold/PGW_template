@@ -1,0 +1,230 @@
+---
+title: "Import and tidy microscopic cell count numbers"
+author: "Maximilian Berthold"
+date: "`r format(Sys.Date())`"
+output:
+  html_document:
+    df_print: paged
+    code_folding: hide   
+csl: plos-one.csl
+bibliography: SalinityAlyson.bib
+---
+This .Rmd imports microscopy cell count data from a googlesheet. Cell counts need to be calculated for the amount of counted chambers of Neubauer hemacytometer. Different magnifications represent different cells/volume. 
+
+# Set Chunk Options
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE)
+knitr::opts_chunk$set(fig.path='Plots/')
+```
+
+
+```{r set project variables}
+#"..", takes up a level in the directory path
+Project <- "salinity_growth"
+FileIDSingle <- "Ab"
+Replic <- "AllSal"
+DataType <- "Calibration"
+DataFolder <- "ProcessData"
+DataOut <- "CalibrationData"
+
+FileEncode <- "UTF-8" 
+Delimiter <- "\t"
+
+#fixed HeaderRows is brittle; better to figure out how to read all data starting at line that contains 'key'
+HeaderRows <- 19
+Comment <- "#"
+
+#Chamber sizes
+Chambers400x <- 16
+ChambLength400x <- 0.2
+ChambHeight <- 0.1
+
+```
+
+```{r load libraries} 
+# libraries; Note check actual dependencies
+library(tidyverse)
+library(lubridate)
+library(broom)
+library(googlesheets4)
+library(googledrive)
+
+```
+
+
+``` {r load auxilliar data}
+
+MetaData <- read_csv("../MURIS_catalog.csv")
+AbData <- readRDS(file = file.path(DataFolder,paste(Project,FileIDSingle, "GrowthLongOD.Rds", sep  = "_"),fsep = .Platform$file.sep))
+
+AbData <- AbData %>%
+  mutate(CorrOD = if_else(CorrOD < 0.001, 0.001, CorrOD)) %>% #experimentally test to set values below 0.001 to 0.001 (~detection limit device)
+  filter(Wavelength %in% c(720, 750)) %>%
+  mutate(datetime = ymd_hms(datetime)) %>%
+  separate(datetime, into = c("date_CC", "time_ab"), sep = " ", remove = FALSE) %>%
+  mutate(date_CC = ymd(date_CC))
+
+
+```
+
+```{r googlesheets}
+gs4_auth(
+  scopes = 'https://www.googleapis.com/auth/spreadsheets',
+  path = Sys.getenv('GOOGLE_DRIVE_KEY')
+)
+
+#gs4_deauth()
+#deauthorizes access to googlesheet
+
+CellCountRaw <- read_sheet("https://docs.google.com/spreadsheets/d/10DjuLOeqg5prDvrLEzFw8BCaHX9K6ZhngtLnevNafck/edit#gid=0")
+```
+
+
+```{r tidy up, message=FALSE, warning=FALSE}
+
+CellCountTidy <- CellCountRaw %>%
+  rename("datetime_CC" = "Date_time") %>%
+  mutate(datetime_CC = ymd_hm(datetime_CC), cells = as.numeric(cells)) %>%
+  separate(datetime_CC, into = c("date_CC", "time_CC"), sep = " ", remove = FALSE) %>%
+  mutate(date_CC = ymd(date_CC)) %>%
+  mutate(Cells_mL = (cells/((ChambLength400x^2)*(chambers_counted/Chambers400x)*ChambHeight)*1000)) %>%
+  full_join(AbData, by = c("id", "date_CC")) %>%
+  drop_na(cells, CorrOD)
+  
+
+
+```
+
+```{r}
+CellCountTidy %>%
+  filter(Wavelength == c(720, 750)) %>%
+  ggplot(aes(x = (Cells_mL), y = CorrOD, color = as.factor(Wavelength))) +
+  geom_point() +
+  facet_grid(rows = vars(strain))
+```
+``` {r plot light/strain-specific correlations}
+
+# Strains = c("CZS25K", "CCMP1333", "CCMP836", "NIES981", "CZS48M")
+OneStrain = c("CZS25K")
+LowLight = 30
+MedLight = 150
+HighLight = 300
+OD_WL = 720
+
+lm_eqn <- function(df){
+    m <- lm(Cells_mL ~ CorrOD, df);
+    eq <- substitute(italic(y) == a + b %.% italic(x)*","~~italic(r)^2~"="~r2, 
+         list(a = format(unname(coef(m)[1]), digits = 2),
+              b = format(unname(coef(m)[2]), digits = 2),
+             r2 = format(summary(m)$r.squared, digits = 3)))
+    as.character(as.expression(eq));
+} #https://stackoverflow.com/questions/7549694/add-regression-line-equation-and-r2-on-graph
+
+
+
+
+CellLowLight <- CellCountTidy %>%
+  #filter(OD != 'NA') %>% 
+  filter(strain %in% OneStrain) %>%
+  filter(Wavelength == OD_WL) %>%
+  #filter(source_salinity == 36) %>%
+  mutate(par_ue = as.factor(par_ue)) %>%
+  filter(par_ue == LowLight) 
+
+
+LowLightCoeff <- summary(lm(Cells_mL ~ CorrOD, CellLowLight))$coefficients
+LowLightEstimates <- LowLightCoeff[ , 1]
+
+
+CellMedLight <- CellCountTidy %>%
+  #filter(OD != 'NA') %>% 
+  filter(strain %in% OneStrain) %>%
+  filter(Wavelength == OD_WL) %>%
+  #filter(source_salinity == 36) %>%
+  mutate(par_ue = as.factor(par_ue)) %>%
+  filter(par_ue == MedLight)
+
+CellHighLight <- CellCountTidy %>%
+  #filter(OD != 'NA') %>% 
+  filter(Wavelength == OD_WL) %>%
+  filter(strain %in% OneStrain) %>%
+  #filter(source_salinity == 36) %>%
+  mutate(par_ue = as.factor(par_ue)) %>%
+  filter(par_ue == HighLight)
+
+
+# CellStrains <-  ggplot(CellLowLight, aes(x = (E_hours/24), y = Cells_mL, colour = as.factor(exp_date))) +
+#   geom_point() +
+#   geom_point(data = CellMedLight) +
+#   geom_point(data = CellHighLight) +
+#   facet_grid(rows = vars(par_ue), cols = vars(ExpSalinity)) +
+#   xlim(0, 14) +
+#   #ylim(0, 250) +
+#   labs(y = "Cells/mL", x = "elapsed days", caption = paste("strain", OneStrain)) +
+#   theme_bw()
+# CellStrains
+# ggsave(filename = file.path("Plots", paste(OneStrain, "Cell_salinity.png", sep = "_"),fsep = .Platform$file.sep ), plot = CellStrains, height = 4, width = 6)
+
+
+CellOD <- ggplot(CellLowLight, aes(x = Cells_mL, y = CorrOD, colour = par_ue)) +
+  geom_point() +
+  geom_smooth(data = CellLowLight, method = "lm", se=FALSE, color="green", formula = y ~ x) +
+  geom_text(data = CellLowLight, aes(x = 200000000, y = 1.2, label = lm_eqn(CellLowLight)), parse = TRUE) +
+  geom_point(data = CellMedLight) +
+  geom_smooth(data = CellMedLight, method = "lm", se=FALSE, color="red", formula = y ~ x) +
+  geom_text(data = CellMedLight, aes(x = 200000000, y = 1.4, label = lm_eqn(CellMedLight)), parse = TRUE) +
+  geom_point(data = CellHighLight) +
+  geom_smooth(data = CellHighLight, method = "lm", se=FALSE, color="blue", formula = y ~ x) +
+  geom_text(data = CellHighLight, aes(x = 200000000, y = 1.6, label = lm_eqn(CellHighLight)), parse = TRUE) +
+  facet_wrap(vars(strain), ncol = 5) +
+  labs(y = OD_WL,  x = "Cells/mL", caption = paste("strain", OneStrain, "absorption", OD_WL)) +
+  ylim(0, 1.7) +
+  xlim(0, 310000000) +
+  theme_bw() 
+CellOD
+
+ggsave(device = "png", filename = file.path("Plots/RegressionCellCountOD", paste(OneStrain, OD_WL, "CellOD_1Plot_salinity.png", sep = "_"),fsep = .Platform$file.sep ), plot = CellOD, height = 4, width = 6)
+
+CellCountTotal <- CellCountTidy %>%
+  filter(strain == OneStrain) %>%
+  filter(Wavelength == OD_WL) %>%
+  mutate(par_ue = as.factor(par_ue))
+
+CellODTotal <-  CellCountTotal %>%
+  ggplot(aes(x = Cells_mL, y = CorrOD, colour = par_ue)) +
+  geom_point() +
+  geom_smooth(data = CellCountTotal, method = "lm", se=FALSE, color="black", formula = y ~ x) +
+  geom_text(data = CellCountTotal, aes(x = 200000000, y = 1.4, label = lm_eqn(CellCountTotal)), parse = TRUE) +
+  labs(y = OD_WL,  x = "Cells/mL", caption = paste("strain", OneStrain, "absorption", OD_WL)) +
+  ylim(0, 1.7) +
+  xlim(0, 310000000) +
+  theme_bw()
+CellODTotal
+
+ggsave(filename = file.path("Plots/RegressionCellCountOD", paste(OneStrain, OD_WL, "TotalCell_OD_salinity.png", sep = "_"),fsep = .Platform$file.sep ), plot = CellODTotal, height = 4, width = 6)
+
+```
+
+
+
+``` {r extract lm-coefficients}
+CellCountNest <- CellCountTidy %>%
+  group_by(strain, Wavelength) %>%
+  nest(CCODdata = -c(strain, Wavelength)) %>%
+  mutate(CCODlm = map(CCODdata,  possibly(~ lm(CorrOD ~ Cells_mL, data = .x), otherwise = NULL)),
+         CCODlm_tidy = map(CCODlm, possibly(tidy, otherwise = NULL)),
+         CCODlm_glance = map(CCODlm, possibly(glance, otherwise = NULL))) %>%
+  select(-c(CCODdata, CCODlm)) %>%
+  unnest(cols = c(CCODlm_glance)) %>%
+  select(strain, Wavelength, CCODlm_tidy) %>%
+  unnest(cols = CCODlm_tidy) %>%
+  mutate(term = str_replace(term, pattern = "[[(]]", replacement = ""),
+         term = str_replace(term, pattern = "[[)]]", replacement = ""),
+         term = str_replace(term, pattern = "Cells_mL", replacement = "slope"),
+         term = str_replace(term, pattern = "Intercept", replacement = "intercept")) %>%
+  pivot_wider(names_from = term, values_from = estimate:p.value, names_sep = "_")
+
+saveRDS(CellCountNest, file.path(DataOut, paste(Project, DataType, "OD_CellCount.Rds", sep = "_"), fsep = .Platform$file.sep))
+
+```
+

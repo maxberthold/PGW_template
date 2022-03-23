@@ -1,0 +1,247 @@
+---
+title: "Importing and tidying data from the <> fluorometer for Chl determination"
+author: "Maximilian Berthold"
+date: "`r format(Sys.Date())`"
+output:
+  html_document:
+    df_print: paged
+    code_folding: hide   
+csl: plos-one.csl
+---
+
+*Some of the code used to create this R Notebook was refurbished from "PlateAbImport.Rmd" written by Maximilian Berthold, Douglas A. Campbell, Melissa L. Rioux, Sarah J Gore, and Alyson MacCormack.*
+
+```{r set project variables}
+Project <- "salinity_growth"
+DataOut <- "CalibrationData"
+DataType <- "Calibration"
+Catalog <- file.path("MURIS_catalog.csv")
+FileIDSingle <- "OD"
+
+
+DataPath <- file.path("ChlFolder", fsep = .Platform$file.sep)
+DataFolder <- "ProcessData"
+ChloroGoogle <- "https://docs.google.com/spreadsheets/d/1yhmuv7V0clcLpqlsTYBMtfIcsS8Rp5yjtkRH2ktZwk0/edit#gid=0"
+
+FileID <- "fluor"
+
+FileEncode <- "UTF-8" 
+Delimiter <- ","
+
+HeaderRows <- 0
+AbsWL = c(680, 720, 750) #select OD's of interest from plategrowth.Rds
+
+```
+
+
+```{r load libraries}
+
+library(tidyverse)
+library(lubridate)
+library(broom)
+library(googlesheets4)
+library(googledrive)
+
+```
+
+
+```{r load local catalog, message = FALSE, warning = FALSE, echo=FALSE}
+#col_types specified for some columns as only the last few rows of a large dataset contained values for these columns and the values were not being read in properly
+#there is probably a more robust way to deal with this issue
+# MetaData <- read_csv("../MURIS_catalog.csv") %>%
+#   rename(CultureID = id)
+# 
+# MetaData <- MetaData %>%
+#   mutate(ExpSalinity = (((culture_inocul_L * source_salinity)+(media_inocul_L*salinity))/(culture_inocul_L+media_inocul_L)))
+# 
+# GrowthLong <- readRDS(file = file.path(DataFolder,paste(Project,FileIDSingle, "GrowthLong.Rds", sep  = "_"),fsep = .Platform$file.sep)) %>%
+#   rename(CultureID = id) %>% 
+#   mutate(ObsDate = format(datetime, format = "%Y-%m-%d")) 
+#   #filter(E_hours == '0') %>% #select only E-hour == 0, as starting point for plate inoculation and following Solisense-analyses
+#   
+# 
+# 
+# 
+# MetaGrowthData <- full_join(MetaData, GrowthLong) %>%
+#   filter(E_hours != 'NA')
+# 
+# MediaBlank <- readRDS(file = file.path(DataFolder,paste(Project, "MediaBlankAll.Rds", sep  = "_"),fsep = .Platform$file.sep)) %>%
+#   group_by(Wavelength, ExpSalinity) %>%
+#   summarise(MeanBlankOD = mean(OD))
+# 
+# MetaGrowthBlank <- left_join(MetaGrowthData, MediaBlank, by = c("ExpSalinity", "Wavelength")) %>%
+#   filter(Wavelength %in% AbsWL) 
+
+GrowthLong <- readRDS(file = file.path(DataFolder,paste(Project,FileIDSingle, "GrowthLong.Rds", sep  = "_"),fsep = .Platform$file.sep))
+
+GrowthLong <- GrowthLong %>%
+  mutate(CorrOD = if_else(CorrOD < 0.001, 0.001, CorrOD)) %>% #experimentally test to set values below 0.001 to 0.001 (~detection limit device)
+  mutate(ObsDate = format(datetime, format = "%Y-%m-%d")) %>%
+  mutate(ObsDate = ymd(ObsDate)) %>%
+  filter(Wavelength %in% AbsWL)
+
+```
+
+```{r data read adds filename and cdate, warning=FALSE, message=FALSE, echo=FALSE}
+#design choice 2 file reading functions or add a filetype variable to a single function
+#stringsAsFactors =FALSE somewhere? 
+
+# read.delim_plus <- function(flnm, file_encode, delimiter, header_rows){read.delim(flnm, fileEncoding = file_encode, sep = delimiter,  skip = header_rows, row.names = NULL) %>% mutate(filename = flnm, cdatetime = ymd_hms(file.info(flnm)$ctime))
+# }
+# 
+# 
+# SolFit <- SolisenseFiles %>% map_df(~read.delim_plus(flnm = ., file_encode = FileEncode, delimiter = Delimiter, header_rows = HeaderRows)) 
+# 
+# SolFitTrim <-SolFit %>% 
+#   separate(col = Source.DataFile, into = c("fp1", "fp2", "fp3", "fp4", "project", "datetime", "CultureID","Ex_WL", "data"), sep = "([\\:\\/\\_\\.\\\\])", remove = FALSE) %>%
+#   select(-c("fp1", "fp2", "fp3", "fp4", "data"))  %>%
+#   mutate(DATE = ymd(DATE), TIME = hms(TIME))%>%
+#   rename(ObsDate = DATE, ObsTime = TIME) %>%
+#   mutate(datetime = as.numeric(datetime), Ex_WL = as.factor(as.numeric(Ex_WL))) %>%
+#   mutate(Fv.Fm = as.numeric(as.character(Fv.Fm)), Light_1 = as.numeric(as.character(Light_1)), Light_5 = as.numeric(as.character(Light_5))) %>%
+#   mutate(datetime = ymd_hm(datetime)) %>%
+#   rename(StartDateTime = datetime) %>%
+#   drop_na(StartDateTime)
+
+gs4_deauth()
+ChloroData <- read_sheet(ChloroGoogle)
+
+ChlFluor <- ChloroData %>%
+  mutate(ChlDateTime = ymd_hms(paste(DATE, TIME))) %>%
+  rename(ObsDate = DATE, ObsTime = TIME, id = CultureID) %>%
+  mutate(ObsDate = ymd(ObsDate)) %>%
+  mutate(Chl_dil = (Reading_rfu - Chl_intercept)/Chl_slope,
+         Chl_ugL = Chl_dil * ((SolventVol_ul + SampleVol_ul)/SampleVol_ul)) %>%
+  group_by(id, ObsDate) %>%
+  summarize (Chl_ugL_mean = mean(Chl_ugL, na.rm = TRUE), .groups = "keep") %>%
+  ungroup() %>%
+  filter(Chl_ugL_mean > 0)
+  
+
+
+ChlMeta <- full_join(GrowthLong, ChlFluor, by = c("id" = "id", "ObsDate" = "ObsDate")) %>% 
+  drop_na(Chl_ugL_mean) %>%
+  group_by(exp_date, salinity, plate, par_ue) %>% #group_by ExpDate and salinity to show replicated wells within one consecutive plot, even with different CultureID's
+  #mutate(EHours = as.numeric((datetime - datetime[1])/3600)) %>% 
+  ungroup() %>%
+  pivot_wider(id_cols = -c(OD, AvBlankOD), names_from = Wavelength, values_from = CorrOD, names_glue = "nm_{Wavelength}") %>% 
+  mutate("OD680min720" = nm_680 - nm_720, "OD680min750" = nm_680 - nm_750) 
+
+
+```
+
+
+
+```{r plot data}
+# ExpDate <- 20200911
+# culture <- c('MaBe2250', 'MaBe2251', 'MaBe2252', 'MaBe2253', 'MaBe2254', 'MaBe2255')
+# strain_source = c('AlMa1493')
+# Media = 'BG11+Na2CO3'
+# Plate = c(163:165)
+
+# Strains = c("CZS25K", "CCMP1333", "CCMP836", "NIES981", "CZS48M")
+OneStrain = "CZS25K"
+LowLight = 30
+MedLight = 150
+HighLight = 300
+OD_WL = 680
+
+lm_eqn <- function(df){
+    m <- lm(OD680min720 ~ Chl_ugL_mean, df);
+    eq <- substitute(italic(y) == a + b %.% italic(x)*","~~italic(r)^2~"="~r2, 
+         list(a = format(unname(coef(m)[1]), digits = 2),
+              b = format(unname(coef(m)[2]), digits = 2),
+             r2 = format(summary(m)$r.squared, digits = 3)))
+    as.character(as.expression(eq));
+} #https://stackoverflow.com/questions/7549694/add-regression-line-equation-and-r2-on-graph
+
+
+
+
+ChlLowLight <- ChlMeta %>%
+  #filter(OD != 'NA') %>% 
+  filter(strain == OneStrain) %>%
+  #filter(Wavelength == OD_WL) %>%
+  #filter(source_salinity == 36) %>%
+  mutate(par_ue = as.factor(par_ue)) %>%
+  filter(par_ue == LowLight) 
+
+ChlMedLight <- ChlMeta %>%
+  #filter(OD != 'NA') %>% 
+  filter(strain == OneStrain) %>%
+  #filter(Wavelength == OD_WL) %>%
+  #filter(source_salinity == 36) %>%
+  mutate(par_ue = as.factor(par_ue)) %>%
+  filter(par_ue == MedLight)
+
+ChlHighLight <- ChlMeta %>%
+  #filter(OD != 'NA') %>% 
+  #filter(Wavelength == OD_WL) %>%
+  filter(strain == OneStrain) %>%
+  #filter(source_salinity == 36) %>%
+  mutate(par_ue = as.factor(par_ue)) %>%
+  filter(par_ue == HighLight)
+
+
+ChlStrains <-  ggplot(ChlLowLight, aes(x = (E_hours/24), y = Chl_ugL_mean, colour = as.factor(par_ue))) +
+  geom_point() +
+  geom_point(data = ChlMedLight) +
+  geom_point(data = ChlHighLight) +
+  facet_grid(rows = vars(par_ue), cols = vars(CalcSal)) +
+  xlim(0, 14) +
+  #ylim(0, 250) +
+  labs(y = "Chlorophyll a (rfu)", x = "elapsed days", caption = paste("strain", OneStrain)) +
+  theme_bw()
+ggsave(filename = file.path("Plots", paste(OneStrain, "Chl_salinity.png", sep = "_"),fsep = .Platform$file.sep ), plot = ChlStrains, height = 4, width = 6)
+
+
+ChlFluorOD <- ggplot(ChlLowLight, aes(x = (OD680min720), y = Chl_ugL_mean, colour = par_ue)) +
+  geom_point() +
+  geom_smooth(data = ChlLowLight, method = "lm", se=FALSE, color="black", formula = y ~ x) +
+  geom_text(data = ChlLowLight, aes(x = 0.2, y = 400, label = lm_eqn(ChlLowLight)), parse = TRUE) +
+  geom_point(data = ChlMedLight) +
+  geom_smooth(data = ChlMedLight, method = "lm", se=FALSE, color="black", formula = y ~ x) +
+  geom_text(data = ChlMedLight, aes(x = 0.2, y = 400, label = lm_eqn(ChlMedLight)), parse = TRUE) +
+  geom_point(data = ChlHighLight) +
+  geom_smooth(data = ChlHighLight, method = "lm", se=FALSE, color="black", formula = y ~ x) +
+  geom_text(data = ChlHighLight, aes(x = 0.2, y = 400, label = lm_eqn(ChlHighLight)), parse = TRUE) +
+  facet_grid(rows = vars(par_ue)) +
+  labs(y = "Chlorophyll a (ug/L)",  x = "OD 680 - 720 nm", caption = paste("strain", OneStrain, "absorption 680 - 720 nm")) +
+  #ylim(0, 450) +
+  #xlim(0, 0.3) +
+  theme_bw() 
+
+ChlFluorOD
+
+ggsave(filename = file.path("Plots", paste(OneStrain, "OD680_720", "Chl_OD_salinity.png", sep = "_"),fsep = .Platform$file.sep ), plot = ChlFluorOD, height = 4, width = 6)
+
+
+```
+
+
+```{r save StrStiMeta, echo=FALSE}
+ChlLong <- ChlMeta %>%
+  pivot_longer(cols = c(nm_680, nm_720, nm_750, "OD680min720", "OD680min750"), values_to = "CorrOD", names_to = "Wavelength") %>%
+  mutate(Wavelength = str_remove(Wavelength, "nm_")) %>%
+  mutate(CorrOD = if_else(CorrOD < 0.001, 0.001, CorrOD))
+
+ChlNest <- ChlLong %>%
+  group_by(strain, Wavelength) %>%
+  nest(ChlODdata = -c(strain, Wavelength)) %>%
+  mutate(ChlODlm = map(ChlODdata,  possibly(~ lm(CorrOD ~ Chl_ugL_mean, data = .x), otherwise = NULL)),
+         ChlODlm_tidy = map(ChlODlm, possibly(tidy, otherwise = NULL)),
+         ChlODlm_glance = map(ChlODlm, possibly(glance, otherwise = NULL))) %>%
+  select(-c(ChlODdata, ChlODlm)) %>%
+  unnest(cols = c(ChlODlm_glance)) %>%
+  select(strain, Wavelength, ChlODlm_tidy) %>%
+  unnest(cols = ChlODlm_tidy) %>%
+  mutate(term = str_replace(term, pattern = "[[(]]", replacement = ""),
+         term = str_replace(term, pattern = "[[)]]", replacement = ""),
+         term = str_replace(term, pattern = "Cells_mL", replacement = "slope"),
+         term = str_replace(term, pattern = "Intercept", replacement = "intercept"),
+         Wavelength = str_replace(Wavelength, pattern = "OD", replacement = "")) %>%
+  pivot_wider(names_from = term, values_from = estimate:p.value, names_sep = "_")
+
+saveRDS(ChlNest, file.path(DataOut, paste(Project, DataType, "OD_Chl.Rds", sep = "_"), fsep = .Platform$file.sep))
+
+```

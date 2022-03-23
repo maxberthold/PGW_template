@@ -1,0 +1,505 @@
+---
+title: "Import microbial plate growth fluorescence data for salinity growth trials"
+author: "Maximilian Berthold, Douglas A. Campbell, Alyson MacCormack"
+date: "`r format(Sys.Date())`"
+output:
+  html_document:
+    df_print: paged
+    code_folding: hide
+    
+csl: plos-one.csl
+bibliography: SalinityAlyson.bib
+---
+
+
+This .Rmd imports Clariostar Fluorescence wellplate files, currently generated using the double emission scan/excitation scan protocol stored in 'MURIS_Ex440_Em680'
+The size of the wellplate does not matter; the import creates columns for RowColumn LetterNumber (A01 etc.) for the largest plate type in the list of files.
+Import of smaller plate types results in NA in the non-existent RowColumn for that plate.
+
+An example citation
+[@apteRelationshipSodiumInflux1987]
+
+```{r set project variables, echo=FALSE}
+Project <- "salinity_growth"
+DataOut <- "ProcessData"
+Catalog <- "MURIS_catalog.csv"
+
+#set variables for file import & processing of Absorbance files
+DataPathCS <- file.path("CSdata", fsep = .Platform$file.sep)
+FileIDSingle <- "_Ex440_Em680_"
+#FileIDExclude <- "DCMU"
+
+FileEncodeCS <- "UTF-8" 
+DelimCS <- ","
+
+SkipCS <- "Well"
+
+CommChar = ":"
+#made this more robust to variable file formats by skipping rows until 'Well' detected in first column; not yet implemented
+#https://community.rstudio.com/t/read-csv-file-until/41711/2
+HeaderRowsCS <- 6
+```
+
+
+
+```{r load libraries, echo=FALSE, message = FALSE, warning = FALSE} 
+# libraries; Note check actual dependencies
+library(tidyverse)
+library(lubridate)
+#library(googledrive)
+#library(googlesheets4)
+library(stringr)
+library(broom)
+library(knitr)
+library(OneR)
+#library(here)
+source("CampbelLabRFunctions.txt")
+```
+
+
+```{r load local catalog, message = FALSE, warning = FALSE, echo=FALSE}
+#name directory with culture catalog
+#generally avoid hard file paths; use only relative
+#set current 'project' name; use for later saving to process_data
+#make more complex to cope with saving of data subsets later
+#hard coded path here to reach upwards to /MURIS/ directory for catalog; difficult to otherwise reach upwards from .Rproj directory 'salinity_growth'
+
+MetaData <- read_csv("../MURIS_catalog.csv")
+MediaData <- read_csv("../MURISMediaCatalog.csv")
+BlankData <- readRDS(file = file.path(DataOut, "salinity_growth_MediaBlankAll.Rds",fsep = .Platform$file.sep))
+
+
+# BlankTar <- BlankData %>%
+#   rename("AvBlankODTar" = "AvBlankOD")
+# 
+# BlankInoc <- BlankData %>%
+#   rename("inoc_media_id" = "target_media_id", "AvBlankODInoc" = "AvBlankOD")
+
+# MetaBlankTar <- full_join(MetaData, BlankTar)
+# 
+# MetaBlankInoc <- full_join(MetaData, BlankInoc)
+# 
+# MetaBlank <- full_join(MetaBlankInoc, MetaBlankTar)
+
+MediaDataTarget <- MediaData %>%
+  select(MediaID, MeasuredSalinity_ppt) %>%
+  rename("target_media_id" ="MediaID")
+
+MediaDataInoc <- MediaData %>%
+  select(MediaID, MeasuredSalinity_ppt) %>%
+  rename("inoc_media_id" = "MediaID")  
+
+MetaMediaTarget <- full_join(MetaData, MediaDataTarget) %>%
+  rename("TargMedSal" = "MeasuredSalinity_ppt")
+
+MetaMediaInoc <- full_join(MetaData, MediaDataInoc) %>%
+  rename("InocMedSal" = "MeasuredSalinity_ppt")
+
+
+MetaMedia <- full_join(MetaMediaTarget, MetaMediaInoc) %>%
+  mutate(CalcSal = ((TargMedSal*media_inocul_L)+(InocMedSal*culture_inocul_L))/(media_inocul_L+culture_inocul_L))
+
+MetaMediaBlank <- full_join(MetaMedia, BlankData) %>%
+  select(-OD, -filename, -cdatetime, -DM, -datetime, -Project)
+
+```
+
+
+```{r load catalog direct from googlesheet, message = FALSE, warning = FALSE, echo=FALSE}
+#implement read with googlesheet name instead of full url
+# <- drive_get(paste(Project, "Catalog", sep = ""))
+#MetaDataPlateworx <- read_sheet(catalog$id)
+# <- read_sheet("https://docs.google.com/spreadsheets/d/11GobNEFC5NgAeONy8OQ0kJJrD75aBC_L26pYPkr98Q4/edit#gid=0")
+```
+
+
+```{r variables for file import & processing ClarioStar, message = FALSE, warning = FALSE, echo=FALSE, results='hide'}
+
+#set variables for file import & processing; single and doublescan files
+EmWl <- c(650,680)
+#ext = "*.txt"
+
+#list of chl excitation_files; only true, if Ex440 was measured regardless of single or double scan; write function for pattern?
+
+ChlFilesCS <- list.files(path = DataPathCS, pattern = FileIDSingle, full.names = TRUE) 
+
+#ChlFilesCS <- ChlFilesCS[ !grepl(FileIDExclude, ChlFilesCS) ]
+
+
+#alternative reading in directly from dropbox directory shared link
+#test <- read.csv("https://www.dropbox.com/s/7xg5u0z1gtjcuol/mtcars.csv?dl=1")
+
+#get creation dates for chl_files
+#chl_datetime_CS <- file.info(ChlFilesCS)$ctime
+#now handled in import function
+
+#test for duplicate file names in chl_files
+unique(duplicated(ChlFilesCS))
+
+#list of secondary pigment files
+#second_files_CS <- list.files(path = DataPathCS, pattern = "*Ex550*", full.names = TRUE)
+#duplicated(second_files_CS)
+
+```
+
+
+```{r read CS data using map_df, echo=FALSE}
+#THIS BLOCK HAS TO BE RUN IN ORDER TO WORK; IT SEPARATES A VARIABLE NUMBER OF 'HEADER' ROWS IDENTIFIED BY CHARACTER STRINGS IN THE FIRST COLUMN
+
+#design choice 2 file reading functions or add a filetype variable to a single function
+#stringsAsFactors =FALSE somewhere? 
+
+#works if number of headerrows fixed
+# read.delim_plus <- function(flnm, file_encode, delimiter, header_rows, comm){read.delim(flnm, fileEncoding = file_encode, sep = delimiter,  skip = header_rows, comment.char = comm,row.names = NULL) %>% mutate(filename = flnm, cdatetime = ymd_hms(file.info(flnm)$ctime))
+# }
+
+#read everything, then filter out header rows by identifier character strings
+# read.delim_plus2 <- function(flnm, file_encode, delimiter,comm){read.delim(flnm, fileEncoding = file_encode, sep = delimiter,comment.char = comm,row.names = NULL, header = FALSE) %>% mutate(filename = flnm, cdatetime = ymd_hms(file.info(flnm)$ctime))
+# }
+
+#this function filters out header rows by looking for what you want to "skip" to, some rows only have 14 columns, as these were 12 well plates, filtering by plate number later on should fix this issue
+fread_plus <- function(Flnm, Skip, FileEncode, Delim){data.table::fread(file = Flnm, skip = Skip, encoding = FileEncode, sep = Delim, header = TRUE) %>%
+    mutate(Filename = Flnm, CDateTime = ymd_hms(file.info(Flnm)$ctime))
+}
+
+
+ChlSpecCS <- ChlFilesCS %>%
+  map_df(~fread_plus(Flnm = ., Skip = SkipCS, FileEncode = FileEncodeCS, Delim = DelimCS))
+
+ChlSpecCS <- ChlSpecCS %>%
+  filter(!str_detect(Well, pattern = "Content"))
+colnames(ChlSpecCS)[2] <- "Wavelength"
+  
+# read.delim_plus <- function(flnm, file_encode, delimiter, header_rows){read.delim(flnm, fileEncoding = file_encode, sep = delimiter,  skip = header_rows) 
+# }
+# 
+# 
+# test <- ChlFilesCS %>% map_df(~read.delim_plus(flnm = ., file_encode = FileEncodeCS, delimiter = DelimCS, header_rows = HeaderRowsCS)) 
+
+# ChlSpecCS <- ChlFilesCS %>% map_df(~read.delim_plus(flnm = ., file_encode = FileEncodeCS, delimiter = DelimCS, header_rows = HeaderRowsCS, comm = "#")) 
+
+# ChlSpecCS <- ChlFilesCS %>%
+#   map_df(~read.delim_plus2(flnm = ., file_encode = FileEncodeCS, delimiter = DelimCS, comm = CommChar))
+# 
+# ChlSpecCS <- ChlSpecCS %>%
+#   filter(V1 != "Content", V1 !=  "Fluorescence (FI) spectrum", V1 != "") %>%
+#   filter(!str_detect(V1, pattern = CommChar)) %>%
+#   filter(!str_detect(V1, pattern = "Use")) %>%
+#   filter(!str_detect(V1, pattern = "ID")) %>%
+#   filter(!str_detect(V1, pattern = "Test")) %>%
+#   filter(!str_detect(V1, pattern = "Test")) %>%
+#   select(1, filename, cdatetime, everything()) 
+
+# Names <- drop_na(ChlSpecCS)
+#   
+# 
+# Names <- lapply(Names[1,], as.character)
+# Names <- unlist(Names)
+# 
+# colnames(ChlSpecCS) <- Names
+# colnames(ChlSpecCS)[2] <- "Wavelength"
+# 
+# ChlSpecCS <- ChlSpecCS %>%
+#   filter(!str_detect(Well, pattern = "Well")) %>%
+#   filter(!str_detect(Well, pattern = "Content")) %>%
+#   rename(filename = 15) %>%
+#   rename(datetime = 16) 
+
+```
+
+
+
+```{r tidy up CS singlescan files, message = FALSE, warning = FALSE, echo=FALSE}
+
+#from filename
+#chl_ex_trim_oneCS <- chl_ex_oneCS %>% 
+#  separate(col = filename, into = c("data","date", "time", "ParMet", "Ex", "plate","csv"), sep = "([\\/\\_\\.\\:])", remove = FALSE) %>% 
+#  separate(col = Ex, into = c("Ex","Exlambda"), sep = 2) %>%
+#  separate(col = plate, into = c("cplate", "plate"), sep = 5) %>%
+#  select(-Ex, -data, -csv, -Well, -ParMet, -cplate, -filename, -cdatetime) %>% #well_col only for Ex_scans w/ fixed Em
+#  rename(Wavelength = X) %>%
+#  rename_all(funs(str_replace(., "0", ""))) %>%
+#  subset(Wavelength != "Wavelength [nm]" & Wavelength != "") %>% #robust approach to filter possible groups in metadata -> not necessary with cultureID
+#  unite(datetime, date, time, remove = TRUE)
+
+#convert cdatetime in POSIXct date and time
+#chl_ex_trim_oneCS$datetime <- ymd_hm(chl_ex_trim_oneCS$datetime)
+
+
+#convert Wavelength (factor) to index the levels by the factor itself, and then to convert to numeric
+#chl_ex_trim_oneCS$Wavelength <- as.numeric(as.character(chl_ex_trim_oneCS$Wavelength))
+
+#convert data columns to numeric; define only specific col, as wells are already numeric
+#IMPORTANT: transforms metadata in col[1] to NA
+#ColsNumCS <- c("Exlambda", "plate")
+#chl_ex_trim_oneCS[ColsNumCS] <- sapply(chl_ex_trim_oneCS[ColsNumCS], as.numeric)
+#chl_ex_trim_oneCS <- chl_ex_trim_oneCS %>%
+# filter(!is.na(Wavelength))
+
+#convert to long format for easier ggplot
+#chl_ex_long_oneCS <- pivot_longer(data = chl_ex_trim_oneCS, cols = -c(Wavelength, datetime:plate), names_to = "well", values_to = "RFU")
+
+
+#chl_ex_long_oneCS$RFU <- as.numeric(as.character(chl_ex_long_oneCS$RFU))
+
+
+```
+
+
+
+```{r tidy up CS doublescan files, message = FALSE, warning = FALSE, echo=FALSE}
+
+#from filename
+ChlSpecTrimCS <- ChlSpecCS %>% 
+  separate(col = Filename, into = c("fp1","Project", "Ex", "Em", "date", "time","plate","DCMU","csv"), sep = "([\\/\\_\\.\\:])", remove = FALSE) %>% 
+  separate(col = Ex, into = c("Ex","ExLambda"), sep = 2) %>%
+  separate(col = Em, into = c("Em", "EmLambda"), sep = 2) %>%
+  separate(col = plate, into = c("cplate", "plate"), sep = 5) %>%
+  mutate(if_else(DCMU == "DCMU", true = 1, false = 0)) %>%
+  select(-fp1, -Project, -csv, -cplate, -Filename, -DCMU, - CDateTime) %>% 
+  rename(., DCMU = starts_with("if_else")) %>%
+  rename_all(funs(str_replace(., "0", ""))) %>%
+  subset(Wavelength != "Wavelength [nm]" & Wavelength != "") %>% #robust approach to filter possible ClarioStar-assigned groups in metadata -> not necessary with cultureID
+  unite(datetime, date, time, remove = TRUE)
+  
+#split data.frame into two parts to later rebind them -> ExSpectrum and EmSpectrum
+
+
+ChlExSpecCS <- ChlSpecTrimCS %>%
+  subset(Well == "Raw Data (Ex Spectrum)") %>%
+  select(-Ex, -ExLambda) %>%
+  rename(Ex_Em = Em) %>%
+  rename(ExEmLambda = EmLambda) %>%
+  select(-Well)
+
+ChlEmSpecCS <- ChlSpecTrimCS %>%
+  subset(Well == "Raw Data (Em Spectrum)") %>%
+  select(-Em, -EmLambda) %>%
+  rename(Ex_Em = Ex) %>%
+  rename(ExEmLambda = ExLambda) %>%
+  select(-Well)
+
+
+ChlExEmSpecTrimCS <- bind_rows(ChlEmSpecCS, ChlExSpecCS) #all col must be of same type -> tidy up thoroughly both df to match
+
+#convert cdatetime in POSIXct date and time
+ChlExEmSpecTrimCS$datetime <- ymd_hm(ChlExEmSpecTrimCS$datetime)
+
+
+#convert Wavelength (factor) to index the levels by the factor itself, and then to convert to numeric
+ChlExEmSpecTrimCS$Wavelength <- as.numeric(as.character(ChlExEmSpecTrimCS$Wavelength))
+
+#convert data columns to numeric; define only specific col, as wells are already numeric
+#IMPORTANT: transforms metadata in col[1] to NA
+
+
+#convert to long format for easier ggplot
+ChlLongCS <- pivot_longer(data = ChlExEmSpecTrimCS, cols = -c(Wavelength, Ex_Em:plate, DCMU), names_to = "well", values_to = "RFU")
+
+
+#ChlLongCS$RFU <- as.numeric(as.character(ChlLongCS$RFU))
+ColsNumCS <- c("ExEmLambda", "plate", "RFU")
+ChlLongCS[ColsNumCS] <- sapply(ChlLongCS[ColsNumCS], as.numeric)
+ChlLongCS <- ChlLongCS %>%
+ filter(!is.na(RFU))
+
+```
+
+
+```{r combining metadata and chl_ex_long using inner_join, message = FALSE, warning = FALSE, echo=FALSE}
+
+#correctly joins both df, and kicks out wells without culture-ID -> empty wells! 
+
+
+ChlAllCS <- ChlLongCS %>%
+  inner_join(MetaMediaBlank, by = c("plate" = "plate", "well" = "well", "Wavelength" = "Wavelength")) %>%
+  distinct()#vector is important to correctly bind both, plate and well-col
+
+test2 <- inner_join(MetaData, ChlLongCS) 
+test3 <- test2 %>% group_by(id) %>% mutate(E_hours = as.numeric((datetime - datetime[1])/3600)) %>% ungroup()
+
+#ChlExAll_CS <- chl_ex_long_CS %>%
+#  inner_join(MetaDataPlateworx, by = c("plate" = "plate", "well" = "well")) #vector is important to correctly bind both, plate and well-col
+
+ChlAll <- ChlAllCS #all col must be of same type -> tidy up thoroughly both df to match
+
+ChlAll <- ChlAll %>%
+ filter(!is.na(RFU)) %>%
+ arrange(datetime, plate)
+
+#bin certain key characteristics, like salinity
+ 
+ChlAll$saltbins <- bin(ChlAll$salinity, nbins = 6, labels = c("1", "4","11", "18", "25", "36"), method = "length", na.omit = FALSE) 
+ChlAll$lightbins <- bin(ChlAll$par_ue, nbins = 3, labels = c("40", "80", "150"), method = "length", na.omit = FALSE) #If there are wells in the catalog w/o salinity, na.omit needs to be FALSE
+
+#including E_hours to complete df
+GrowthLong <- ChlAll %>% group_by(id) %>% mutate(E_hours = as.numeric((datetime - datetime[1])/3600)) %>% ungroup()
+
+
+
+```
+
+
+
+```{r fluor growth plot}
+Wavelength_nm = 680
+Plates = c(312, 313)
+Strains = c("CZS25K","CZS48M", "CCMP836")
+Strain = c("CZS25K")
+
+test3 %>%
+  filter(Wavelength == Wavelength_nm) %>%
+  filter (strain %in% Strain) %>%
+  filter(plate %in% Plates) %>%
+  #filter(source_salinity == 36) %>%
+  ggplot()+
+  geom_point(aes(x = E_hours, y = (RFU), colour = as.factor(well))) +
+  #scale_color_gradient(low="green", high="blue") +
+  facet_grid(rows = vars(strain), cols = vars(par_ue)) + 
+  #coord_cartesian(xlim = c(0, 150), ylim = c(50, 200)) +
+  theme_bw() + 
+  labs(caption = paste(Wavelength_nm, "nm", "strain", Strains))
+
+  # 
+  # 
+  #
+#  scale_color_gradient(low="green", high="blue")+
+#  ggtitle("Growth plot of Haslea with changing pH at different light levels \n(pH increased with buffers)")+
+
+     
+#  coord_cartesian(xlim = c(0, 250)) +
+     #labs(caption = paste(Wavelength_nm, "nm; PAR", par, "uE")) +
+#  filter(strain %in% c("ARC455", "ARC456")) %>%
+  # filter(exp_date %in% c("20200121")) %>%
+  # filter(alkalinity %in% c("2145","2298","2585","3171","4013")) %>%
+#, colour = (pH)
+```
+
+
+```{r save GrowthLong, echo=FALSE}
+saveRDS(GrowthLong, file.path(DataOut, 
+paste(Project, FileIDSingle, "GrowthLong.Rds", sep = ""), fsep = .Platform$file.sep))
+```
+
+```{r variable names for file import & processing MOLECULAR DEVICES}
+
+#set variables for file import & processing
+DataPathMD <- file.path("Olddata", fsep = .Platform$file.sep)
+file_id <- "*_Em"
+
+FileEncodeMD <- "UTF-16LE" 
+DelimiterMD <- "\t"
+HeaderRowsMD <- 17
+
+EmWlMD <- c(650,680)
+#ext = "*.txt"
+
+#list of chl excitation_files
+ChlFilesMD <- list.files(path = data_path_MD, pattern = "*Ex440*", full.names = TRUE)
+
+#alternative reading in directly from dropbox directory shared link
+#test <- read.csv("https://www.dropbox.com/s/7xg5u0z1gtjcuol/mtcars.csv?dl=1")
+
+#get creation dates for chl_files
+ChlDatetimeMD <- file.info(chl_files_MD)$ctime
+
+#test for duplicate file names in chl_files
+unique(duplicated(chl_files_MD))
+
+#list of secondary pigment files
+SecondFilesMD <- list.files(path = data_path_MD, pattern = "*Ex550*", full.names = TRUE)
+unique(duplicated(second_files_MD))
+```
+
+```{r read MD data using map_df, echo=FALSE}
+read.delim_plus <- function(flnm, file_encode, delimiter, header_rows){read.delim(flnm, fileEncoding = file_encode, sep = delimiter,  skip = header_rows, row.names = NULL) %>% 
+    mutate(filename = flnm, cdatetime = ymd_hms(file.info(flnm)$ctime))
+}
+
+ChlExMD <- ChlFilesMD %>% 
+  map_df(~read.delim_plus(flnm = ., file_encode = file_encode_MD, delimiter = delimiter_MD, header_rows = header_rows_MD)) 
+
+```
+
+```{r tidy up MD files}
+
+#from filename
+ChlExTrimMD <- ChlExMD %>% 
+  separate(col = filename, into = c("data","datetime","Emstart", "Emend","Ex", "plate","txt"), sep = "([\\/\\_\\.\\:])", remove = FALSE) %>% 
+  select(-data, -txt) %>% 
+  separate(col = Emstart, into = c("Em","Emstart"), sep = 2) %>% 
+  select(-Em) %>% 
+  separate(col = Ex, into = c("Ex","Exlambda"), sep = 2) %>% 
+  select(-Ex) %>%
+  select(-X) %>%
+  select(-Temperature..C.)
+
+
+#from datetime 
+ChlExTrimMD <- ChlExTrimMD %>% 
+  separate(col = datetime, into = c("date","time"), sep = 8, remove = FALSE) %>%
+  mutate(date = ymd(date)) #does not work for time; pivot_longer does not work with POSIXct
+
+
+#convert data columns to numeric; define only specific col, as wells are already numeric
+#transforms metadata in col[1] to NA
+ColsNumMD <- c("Wavelength", "Emstart", "Emend", "Exlambda")
+ChlExTrimMD[ColsNumMD] <- sapply(ChlExTrimMD[ColsNumMD], as.numeric)
+
+
+#filter data to target wavelengths then assemble well trajectories
+ChlExEmMD <- ChlExTrimMD %>% 
+  filter(Wavelength == 680) %>% 
+  group_by(plate) %>% 
+  arrange(plate, date)
+
+#convert to long format for easier ggplot
+ChlExLongMD <- pivot_longer(data = ChlExEmMD, -c(Wavelength,filename:cdatetime), names_to = "well", values_to = "RFU")
+
+#convert cplate to numeric to use innerjoin
+ChlExLongMD$plate = as.numeric(gsub("\\plate", "", ChlExLongMD$plate))
+
+#convert cdatetime in POSIXct date and time
+ChlExLongMD$date <- format(as.POSIXct(ChlExLongMD$datetime,format="%Y%m%d%H%M"),"%Y-%m-%d")
+ChlExLongMD$time <- format(as.POSIXct(ChlExLongMD$datetime,format="%Y%m%d%H%M"),"%H:%M")
+
+#convert numerals to numeric chl_ex_long
+#chl_ex_long <- chl_ex_long %>% ungroup() %>% mutate(Emstart = as.numeric(Emstart), Emend = as.numeric(Emend), Exlambda = as.numeric(Exlambda), FirstCulture = as.numeric(FirstCulture), LastCulture = as.numeric(LastCulture), RFU = as.numeric(RFU))
+
+```
+
+```{r combining both metadata and ChlExLongMD using inner_join}
+
+#correctly joins both df, and kicks out wells without culture-ID -> empty wells! 
+
+ChlExAllMD <- ChlExLongMD %>%
+  inner_join(MetaData, by = c("plate" = "plate", "well" = "well")) #vector is important to correctly bind both, plate and well-col
+
+ChlExAllMD$bins <- bin(ChlExAllMD$salinity, nbins = 5, labels = c("4","10", "15", "28", "34"), method = "length", na.omit = TRUE)
+
+ChlExAllMD <- ChlExAllMD %>% 
+  group_by(plate, well) %>%
+  mutate(relmax = max(RFU)/RFU[1]) %>%
+  ungroup() 
+
+ChlExAllMD %>%
+  filter(Wavelength == Wavelength_nm) %>%
+  filter (strain %in% Strains) %>%
+  #filter(plate %in% Plates) %>%
+  #filter(OD <=0.9) %>%
+  ggplot()+
+  geom_point(aes(x = E_hours, y = log(RFU), colour = plate)) +
+  scale_color_gradient(low="green", high="blue") +
+  facet_grid(rows = vars(lightbins), cols = vars(saltbins)) + 
+  theme_bw() + 
+  labs(caption = paste(Wavelength_nm, "nm", "strain", Strains))
+
+ChlExAllMD %>%
+  #filter(date <= 2019-08-07) %>%
+  ggplot() + 
+  geom_point(aes(x = bins, y = relmax, colour = par_ue)) +
+  facet_grid(rows = vars(par_ue), cols = vars(strain))+
+  theme_bw()
+```
+
+## Bibliography
