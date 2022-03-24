@@ -12,7 +12,6 @@ Code taken from PGWAbSpectra.Rmd and modified to visualize data from blanks.
 
 ```{r set project variables, echo=FALSE}
 Project <- "PGW"
-Catalog <- "MURIS_catalog.csv"
 
 #set variables for file import & processing of Absorbance files
 FP1 <- ".."
@@ -79,7 +78,7 @@ MetaMediaData <- full_join(MetaData, WL_Media_grid)
 ```
 
 
-```{r data read adds filename and cdate, warning=FALSE, message=FALSE, echo=FALSE}
+```{r data read adds filename, warning=FALSE, message=FALSE, echo=FALSE}
 
 read.delim_plus <- function(flnm, file_encode, delimiter, header_rows){read.delim(flnm, fileEncoding = file_encode, sep = delimiter,  skip = header_rows, row.names = NULL) %>% mutate(filename = flnm)
 }
@@ -103,7 +102,7 @@ AbSpecBlanks <- AbFilesBlank %>% map_df(~read.delim_plus(flnm = ., file_encode =
          Wavelength = as.numeric(as.character(Wavelength)),
          plate = as.numeric(as.character(plate))
   ) %>%
-  pivot_longer(cols = c(A1:D6), names_to = "well", values_to = "OD") %>% #long format better for downstream analyses
+  pivot_longer(cols = -c(filename:Wavelength), names_to = "well", values_to = "OD") %>% #long format better for downstream analyses
   mutate(OD = as.numeric(as.character(OD))) %>%
   rename("BlankOD" = "OD") %>%
   full_join(MetaMediaData) %>% #join with Meta and Media catalog 
