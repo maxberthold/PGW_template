@@ -1,19 +1,16 @@
 ---
 title: "Plot and Analyze microbial plate growth data"
-author: "Douglas A. Campbell, Matt Tanton, Maximilian Berthold, Melissa L. Rioux"
+author: "Maximilian Berthold, Douglas A. Campbell"
 date: "`r format(Sys.Date())`"
 output:
   html_document:
     df_print: paged
 ---
-ToDo
-Add filtering variable values to .Rmd output
 
 Set variables for project
 ```{r project data}
-Project <- "salinity_growth"
-FileIDSingle <- "Chl"
-Replic <- "AllSal"
+Project <- "PGW"
+FileIDSingle <- "Chl" #possible factors: Chl OD CC
 DataFolder <- "ProcessData"
 
 #grouping variables for rows & columns, and for nesting for fitting
